@@ -1,8 +1,11 @@
-# CryptoSafe Manager (Sprint 1)
+# CryptoSafe Manager (Sprint 1–2)
 
 CryptoSafe Manager — настольный менеджер секретов/паролей с **зашифрованной** базой данных, модульной архитектурой и расширяемым GUI.  
 
-> ⚠️ **Важно:** в Спринте 1 используется **криптографическая заглушка (XOR)** вместо настоящего AES-GCM. Это сделано намеренно для построения архитектуры. Реальная криптография появится в **Спринте 3**.
+> ⚠️ **Важно:**  
+> - В **Спринте 1** используется **криптографическая заглушка (XOR)** вместо настоящего AES-GCM.  
+> - В **Спринте 2** уже реализованы **аутентификация**, **Argon2id**, **PBKDF2** и **управление ключами**, но само шифрование записей всё ещё остаётся XOR-заглушкой.  
+> - Реальная криптография для записей появится в **Спринте 3**.
 
 ---
 
@@ -21,8 +24,8 @@ CryptoSafe Manager — настольный менеджер секретов/п
 
 ## Roadmap: 8 спринтов
 
-1. **Sprint 1 (текущий):** фундамент (архитектура, схема БД, заглушки crypto/key, EventBus, GUI shell, тесты, CI)
-2. **Sprint 2:** KeyStore + хранение мастер-пароля (salt+hash+params), unlock flow (блок/разблок)
+1. **Sprint 1:** фундамент (архитектура, схема БД, заглушки crypto/key, EventBus, GUI shell, тесты, CI)
+2. **Sprint 2 (текущий):** KeyStore + хранение мастер-пароля (salt+hash+params), unlock flow (блок/разблок), Argon2id, PBKDF2, кэш ключей, смена пароля
 3. **Sprint 3:** замена XOR на **AES-GCM**, версии записей/миграции, ротация ключей
 4. **Sprint 4:** безопасный буфер обмена (ClipboardCopied/Cleared), таймер очистки
 5. **Sprint 5:** полноценный аудит-лог + подписи, просмотр в GUI
@@ -32,20 +35,73 @@ CryptoSafe Manager — настольный менеджер секретов/п
 
 ---
 
+## Что добавлено в Sprint 2
+
+### Аутентификация
+- Реализована аутентификация по **мастер-паролю**
+- После первичной настройки открывается **диалог входа**
+- При успешном входе:
+  1. проверяется Argon2id-хэш
+  2. формируется ключ шифрования через PBKDF2-HMAC-SHA256
+  3. ключ помещается в кэш памяти
+  4. публикуется событие `UserLoggedIn`
+
+### Политика паролей
+Проверяется:
+- минимальная длина: **12 символов**
+- наличие:
+  - заглавных букв
+  - строчных букв
+  - цифр
+  - специальных символов
+- запрет на распространённые слабые шаблоны:
+  - `password123`
+  - `qwerty`
+  - `123456`
+  - и подобные
+
+### Управление ключами
+- Для проверки пароля используется **Argon2id**
+- Для формирования ключа шифрования используется **PBKDF2-HMAC-SHA256**
+- Реализовано раздельное хранение:
+  - `auth_hash`
+  - `enc_salt`
+  - `params`
+- Ключ шифрования **не сохраняется на диск**
+
+### Кэширование ключа
+- Ключ хранится только в памяти в разблокированной сессии
+- Поддерживается авто-устаревание
+- Ключ очищается:
+  - при выходе пользователя
+  - при закрытии приложения
+  - при блокировке сессии
+
+### Смена пароля
+- Добавлен диалог смены мастер-пароля
+- Реализована ротация ключей:
+  - проверка старого пароля
+  - формирование нового ключа
+  - перешифрование записей
+  - обновление хэшей и соли в `key_store`
+- Используется атомарная транзакция для безопасного отката при ошибке
+
+---
+
 ## Архитектура и структура (MVC-подобная)
 
 Код разделён на модули по принципу MVC/слоёв:
 
-- **Model**: `src/database/` — SQLite schema, helper, модели (Sprint 1)
-- **Core / Controller**: `src/core/` — бизнес-логика, crypto/key, события, состояние, конфиги
+- **Model**: `src/database/` — SQLite schema, helper, модели
+- **Core / Controller**: `src/core/` — бизнес-логика, crypto/key, события, состояние, конфиги, аутентификация
 - **View**: `src/gui/` — Tkinter GUI и переиспользуемые виджеты
 
 ### Поток (MVC)
-1) GUI инициирует действие (например: добавить запись)  
-2) Core шифрует данные и пишет в DB  
-3) Core публикует событие в EventBus (`EntryAdded`)  
+1) GUI инициирует действие (например: вход, добавление записи, смена пароля)  
+2) Core проверяет пароль / формирует ключ / шифрует данные / пишет в DB  
+3) Core публикует событие в EventBus (`EntryAdded`, `UserLoggedIn` и т.д.)  
 4) AuditLogger (подписчик) пишет строку в `audit_log`  
-5) GUI обновляет таблицу
+5) GUI обновляет таблицу или состояние интерфейса
 
 ---
 
@@ -56,25 +112,32 @@ cryptosafe-manager/
 ├── src/
 │   ├── core/
 │   │   ├── crypto/
-│   │   │   ├── abstract.py       # EncryptionService
-│   │   │   └── placeholder.py    # XOR заглушка (Sprint 1)
-│   │   ├── audit.py              # подписчик событий -> audit_log
-│   │   ├── config.py             # ConfigManager (dev/prod)
-│   │   ├── events.py             # EventBus (sync + async)
-│   │   ├── key_manager.py        # derive_key + заглушки store/load
-│   │   ├── state_manager.py      # состояние (lock/clipboard/idle)
-│   │   └── utils.py              # валидация + secure zeroization
+│   │   │   ├── abstract.py         # EncryptionService
+│   │   │   ├── placeholder.py      # XOR заглушка (Sprint 1, используется и в Sprint 2)
+│   │   │   ├── key_derivation.py   # Argon2id + PBKDF2 + password policy
+│   │   │   ├── key_storage.py      # кэш ключей в памяти + keyring stub
+│   │   │   └── authentication.py   # проверка пароля, login/logout, смена пароля
+│   │   ├── audit.py                # подписчик событий -> audit_log
+│   │   ├── config.py               # ConfigManager (dev/prod, crypto params)
+│   │   ├── events.py               # EventBus (sync + async)
+│   │   ├── state_manager.py        # состояние (lock/session/clipboard/idle)
+│   │   └── utils.py                # валидация + secure zeroization
 │   ├── database/
-│   │   ├── models.py             # dataclasses моделей
-│   │   └── db.py                 # SQLite helper + user_version + pool
+│   │   ├── models.py               # dataclasses моделей
+│   │   └── db.py                   # SQLite helper + migrations + user_version + pool
 │   └── gui/
-│       ├── main_window.py        # главное окно + мастер настройки
+│       ├── main_window.py          # главное окно + setup wizard + login + change password
 │       └── widgets/
-│           ├── password_entry.py # masked entry + show/hide
-│           ├── secure_table.py   # таблица записей
-│           ├── settings_dialog.py# заглушка настроек
+│           ├── password_entry.py   # masked entry + show/hide
+│           ├── secure_table.py     # таблица записей
+│           ├── settings_dialog.py  # заглушка настроек
 │           └── audit_log_viewer.py # заглушка аудита
 ├── tests/
+│   ├── test_key_derivation.py
+│   ├── test_key_cache.py
+│   ├── test_authentication.py
+│   ├── test_password_rotation.py
+│   └── ...
 ├── requirements.txt
-├── Dockerfile                    # заглушка (Sprint 8)
-└── .github/workflows/tests.yml   # CI тестов
+├── Dockerfile                      # заглушка (Sprint 8)
+└── .github/workflows/tests.yml     # CI тестов
