@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 import os
-import secrets
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from ..core.audit import AuditLogger
-from ..core.config import ConfigManager
-from ..core.crypto.placeholder import AES256Placeholder
-from ..core.events import EntryAdded, EventBus, UserLoggedIn, UserLoggedOut
-from ..core.key_manager import KeyManager, KdfParams
-from ..core.state_manager import StateManager
-from ..core.utils import validate_safe_text
-from ..database.db import Database
-from .widgets import PasswordEntry, SecureTable, SettingsDialog
+from src.core.audit import AuditLogger
+from src.core.config import ConfigManager
+from src.core.crypto.authentication import AuthenticationManager
+from src.core.crypto.key_derivation import Argon2Config, KeyManager, PBKDF2Config, PasswordPolicy
+from src.core.crypto.key_storage import CachePolicy, SecureKeyCache
+from src.core.crypto.placeholder import AES256Placeholder
+from src.core.events import EntryAdded, EventBus
+from src.core.state_manager import StateManager
+from src.core.utils import validate_safe_text
+from src.database.db import Database
+from src.gui.widgets import PasswordEntry, SecureTable, SettingsDialog
+
 
 class SetupWizard(tk.Toplevel):
-
     def __init__(self, master, cfg_mgr: ConfigManager):
         super().__init__(master)
         self.title("Первоначальная настройка")
@@ -32,7 +33,7 @@ class SetupWizard(tk.Toplevel):
         frm = ttk.Frame(self)
         frm.pack(fill="both", expand=True, padx=14, pady=14)
 
-        ttk.Label(frm, text="Мастер-пароль", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(frm, text="Создайте мастер-пароль", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(frm, text="Пароль:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.pw1 = PasswordEntry(frm)
         self.pw1.grid(row=2, column=0, sticky="ew")
@@ -43,34 +44,17 @@ class SetupWizard(tk.Toplevel):
 
         ttk.Separator(frm).grid(row=5, column=0, sticky="ew", pady=14)
 
-        ttk.Label(frm, text="Расположение базы данных", font=("TkDefaultFont", 10, "bold")).grid(row=6, column=0, sticky="w")
+        ttk.Label(frm, text="Файл БД", font=("TkDefaultFont", 10, "bold")).grid(row=6, column=0, sticky="w")
         self.db_path_var = tk.StringVar(value=self.cfg_mgr.load().db_path)
         row_db = ttk.Frame(frm)
         row_db.grid(row=7, column=0, sticky="ew", pady=(8, 0))
         ttk.Entry(row_db, textvariable=self.db_path_var).pack(side="left", fill="x", expand=True)
         ttk.Button(row_db, text="Выбрать...", command=self._choose_db).pack(side="left", padx=(8, 0))
 
-        ttk.Separator(frm).grid(row=8, column=0, sticky="ew", pady=14)
-
-        ttk.Label(frm, text="Параметры KDF (заглушка)", font=("TkDefaultFont", 10, "bold")).grid(row=9, column=0, sticky="w")
-        grid = ttk.Frame(frm)
-        grid.grid(row=10, column=0, sticky="ew", pady=(8, 0))
-        ttk.Label(grid, text="Iterations:").grid(row=0, column=0, sticky="w")
-        self.iters_var = tk.StringVar(value="120000")
-        ttk.Entry(grid, textvariable=self.iters_var, width=12).grid(row=0, column=1, sticky="w", padx=(8, 0))
-
-        ttk.Label(grid, text="Hash:").grid(row=0, column=2, sticky="w", padx=(18, 0))
-        self.hash_var = tk.StringVar(value="sha256")
-        ttk.Entry(grid, textvariable=self.hash_var, width=10).grid(row=0, column=3, sticky="w", padx=(8, 0))
-
-        ttk.Label(grid, text="DKLen:").grid(row=0, column=4, sticky="w", padx=(18, 0))
-        self.dklen_var = tk.StringVar(value="32")
-        ttk.Entry(grid, textvariable=self.dklen_var, width=6).grid(row=0, column=5, sticky="w", padx=(8, 0))
-
         btns = ttk.Frame(frm)
         btns.grid(row=11, column=0, sticky="e", pady=(18, 0))
         ttk.Button(btns, text="Отмена", command=self._cancel).pack(side="right")
-        ttk.Button(btns, text="Готово", command=self._finish).pack(side="right", padx=(0, 8))
+        ttk.Button(btns, text="Создать", command=self._finish).pack(side="right", padx=(0, 8))
 
         frm.columnconfigure(0, weight=1)
         self.pw1.focus()
@@ -91,81 +75,158 @@ class SetupWizard(tk.Toplevel):
     def _finish(self) -> None:
         pw1 = self.pw1.get()
         pw2 = self.pw2.get()
-        if not pw1 or len(pw1) < 8:
-            messagebox.showerror("Ошибка", "Пароль должен быть не короче 8 символов.")
-            return
         if pw1 != pw2:
-            messagebox.showerror("Ошибка", "Пароли не совпадают.")
+            messagebox.showerror("Ошибка", "Пароли не совпадают")
             return
-
         db_path = self.db_path_var.get().strip()
         if not db_path:
-            messagebox.showerror("Ошибка", "Укажите путь к базе данных.")
+            messagebox.showerror("Ошибка", "Укажите путь к БД")
             return
-
-        try:
-            os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        except Exception:
-            messagebox.showerror("Ошибка", "Невозможно создать каталог для базы данных.")
-            return
-
-        try:
-            iters = int(self.iters_var.get().strip())
-            dklen = int(self.dklen_var.get().strip())
-            hname = self.hash_var.get().strip()
-            if iters < 10_000 or iters > 5_000_000:
-                raise ValueError
-            if dklen not in (16, 24, 32, 48, 64):
-                raise ValueError
-            if hname not in ("sha256", "sha512"):
-                raise ValueError
-        except Exception:
-            messagebox.showerror("Ошибка", "Некорректные параметры KDF.")
-            return
-
-        self.result = (db_path, pw1, KdfParams(iterations=iters, dklen=dklen, hash_name=hname))
+        self.result = (db_path, pw1)
         self.destroy()
+
+
+class LoginDialog(tk.Toplevel):
+    def __init__(self, master, auth: AuthenticationManager):
+        super().__init__(master)
+        self.title("Вход")
+        self.geometry("420x180")
+        self.transient(master)
+        self.grab_set()
+        self.auth = auth
+        self.success = False
+
+        frm = ttk.Frame(self)
+        frm.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ttk.Label(frm, text="Введите мастер-пароль").pack(anchor="w")
+        self.password = PasswordEntry(frm)
+        self.password.pack(fill="x", pady=(8, 0))
+        self.message_var = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=self.message_var).pack(anchor="w", pady=(8, 0))
+
+        btns = ttk.Frame(frm)
+        btns.pack(anchor="e", pady=(12, 0))
+        ttk.Button(btns, text="Войти", command=self._login).pack(side="right")
+        ttk.Button(btns, text="Отмена", command=self._cancel).pack(side="right", padx=(0, 8))
+        self.password.focus()
+
+    def _login(self) -> None:
+        ok, msg = self.auth.authenticate(self.password.get())
+        if ok:
+            self.success = True
+            self.destroy()
+            return
+        self.message_var.set(msg or "Ошибка входа")
+
+    def _cancel(self) -> None:
+        self.success = False
+        self.destroy()
+
+
+class ChangePasswordDialog(tk.Toplevel):
+    def __init__(self, master, auth: AuthenticationManager):
+        super().__init__(master)
+        self.title("Смена пароля")
+        self.geometry("480x300")
+        self.transient(master)
+        self.grab_set()
+        self.auth = auth
+
+        frm = ttk.Frame(self)
+        frm.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ttk.Label(frm, text="Текущий пароль").grid(row=0, column=0, sticky="w")
+        self.cur = PasswordEntry(frm)
+        self.cur.grid(row=1, column=0, sticky="ew")
+
+        ttk.Label(frm, text="Новый пароль").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.new1 = PasswordEntry(frm)
+        self.new1.grid(row=3, column=0, sticky="ew")
+
+        ttk.Label(frm, text="Подтверждение нового пароля").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        self.new2 = PasswordEntry(frm)
+        self.new2.grid(row=5, column=0, sticky="ew")
+
+        self.progress = ttk.Progressbar(frm, mode="determinate")
+        self.progress.grid(row=6, column=0, sticky="ew", pady=(14, 0))
+
+        self.msg_var = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=self.msg_var).grid(row=7, column=0, sticky="w", pady=(8, 0))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=8, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Сменить", command=self._submit).pack(side="right")
+        ttk.Button(btns, text="Закрыть", command=self.destroy).pack(side="right", padx=(0, 8))
+        frm.columnconfigure(0, weight=1)
+
+    def _submit(self) -> None:
+        current = self.cur.get()
+        new1 = self.new1.get()
+        new2 = self.new2.get()
+        if new1 != new2:
+            self.msg_var.set("Новые пароли не совпадают")
+            return
+
+        def progress(done, total):
+            self.progress["maximum"] = max(1, total)
+            self.progress["value"] = done
+            self.update_idletasks()
+
+        ok, msg = self.auth.rotate_password(current, new1, progress_callback=progress)
+        if ok:
+            self.msg_var.set("Пароль успешно изменён")
+        else:
+            self.msg_var.set(msg or "Ошибка смены пароля")
 
 
 class MainWindow(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("CryptoSafe Manager (Sprint 1)")
+        self.title("CryptoSafe Manager (Sprint 2)")
         self.geometry("980x560")
 
-        # Core
         self.bus = EventBus()
         self.state = StateManager()
         self.cfg_mgr = ConfigManager(env=os.getenv("CRYPTOSAFE_ENV", "development"))
         self.cfg = self.cfg_mgr.load()
 
-        self.crypto = AES256Placeholder()
-        self.km = KeyManager()
-        self.master_key: bytes | None = None
-        self.salt: bytes | None = None
-
         self.db = Database(self.cfg.db_path, pool_size=4)
         self.db.initialize()
+
+        self.key_manager = KeyManager(
+            argon2_config=Argon2Config(
+                time_cost=self.cfg.crypto.argon2_time,
+                memory_cost=self.cfg.crypto.argon2_memory,
+                parallelism=self.cfg.crypto.argon2_parallelism,
+                hash_len=self.cfg.crypto.argon2_hash_len,
+                salt_len=self.cfg.crypto.argon2_salt_len,
+            ),
+            pbkdf2_config=PBKDF2Config(
+                iterations=self.cfg.crypto.pbkdf2_iterations,
+                salt_len=self.cfg.crypto.pbkdf2_salt_len,
+                dklen=self.cfg.crypto.pbkdf2_dklen,
+            ),
+            policy=PasswordPolicy(min_length=12),
+        )
+        self.key_cache = SecureKeyCache(CachePolicy(idle_timeout_seconds=self.cfg.auto_lock_seconds))
+        self.auth = AuthenticationManager(self.db, self.key_manager, self.key_cache, self.bus)
+        self.crypto = AES256Placeholder()
 
         self.audit = AuditLogger(self.bus, self.db)
         self.audit.start()
 
-        # GUI
         self._build_menu()
         self._build_main()
         self._build_statusbar()
 
-        self._first_run_if_needed()
-        self._load_test_data_if_empty()
-        self.refresh_table()
-
-        # Mark as logged-in for Sprint 1
-        self.state.set_locked(False)
-        self.bus.publish(UserLoggedIn(username="local"))
-        self._set_status("Готово. (Спринт 1)")
-
+        self.bind_all("<Any-KeyPress>", lambda _e: self._touch_activity())
+        self.bind_all("<Any-Button>", lambda _e: self._touch_activity())
+        self.bind("<Unmap>", self._on_unmap)
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
 
+        self._bootstrap_auth_flow()
+        self.refresh_table()
 
     def _build_menu(self) -> None:
         menubar = tk.Menu(self)
@@ -174,17 +235,13 @@ class MainWindow(tk.Tk):
         file_menu.add_command(label="Создать", command=self.on_new)
         file_menu.add_command(label="Открыть", command=self.on_open)
         file_menu.add_separator()
-        file_menu.add_command(label="Резервная копия", command=self.on_backup_stub)
-        file_menu.add_separator()
+        file_menu.add_command(label="Сменить пароль", command=self.on_change_password)
         file_menu.add_command(label="Выход", command=self.on_exit)
 
         edit_menu = tk.Menu(menubar, tearoff=0)
         edit_menu.add_command(label="Добавить", command=self.on_add_entry)
-        edit_menu.add_command(label="Изменить", command=self.on_edit_entry_stub)
-        edit_menu.add_command(label="Удалить", command=self.on_delete_entry_stub)
 
         view_menu = tk.Menu(menubar, tearoff=0)
-        view_menu.add_command(label="Логи", command=self.on_logs_stub)
         view_menu.add_command(label="Настройки", command=self.on_settings)
 
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -194,103 +251,103 @@ class MainWindow(tk.Tk):
         menubar.add_cascade(label="Правка", menu=edit_menu)
         menubar.add_cascade(label="Вид", menu=view_menu)
         menubar.add_cascade(label="Справка", menu=help_menu)
-
         self.config(menu=menubar)
 
     def _build_main(self) -> None:
         container = ttk.Frame(self)
         container.pack(fill="both", expand=True, padx=10, pady=10)
-
         self.table = SecureTable(container)
         self.table.pack(fill="both", expand=True)
 
     def _build_statusbar(self) -> None:
-        self.status_var = tk.StringVar(value="Статус: (не вошли)")
-        self.clipboard_var = tk.StringVar(value="Буфер: таймер (заглушка)")
         bar = ttk.Frame(self)
         bar.pack(fill="x", side="bottom")
-
+        self.status_var = tk.StringVar(value="Статус: locked")
+        self.session_var = tk.StringVar(value="Сессия: -")
         ttk.Label(bar, textvariable=self.status_var).pack(side="left", padx=10, pady=6)
-        ttk.Label(bar, textvariable=self.clipboard_var).pack(side="right", padx=10, pady=6)
+        ttk.Label(bar, textvariable=self.session_var).pack(side="right", padx=10, pady=6)
 
-    def _set_status(self, text: str) -> None:
-        # Do not include secrets.
-        self.status_var.set(f"Статус: {text}")
+    def _set_status(self, msg: str) -> None:
+        self.status_var.set(f"Статус: {msg}")
 
-
-    def _first_run_if_needed(self) -> None:
-        has = self.db.get_setting("master_salt")
-        if has is not None:
-            self.salt = has[0]
-            self.master_key = AES256Placeholder.random_key(32)
+    def _bootstrap_auth_flow(self) -> None:
+        if not self.auth.is_initialized():
+            wizard = SetupWizard(self, self.cfg_mgr)
+            self.wait_window(wizard)
+            if wizard.result is None:
+                self.destroy()
+                return
+            db_path, password = wizard.result
+            if db_path != self.cfg.db_path:
+                self.cfg.db_path = db_path
+                self.cfg_mgr.save(self.cfg)
+                self.db = Database(self.cfg.db_path, pool_size=4)
+                self.db.initialize()
+                self.audit = AuditLogger(self.bus, self.db)
+                self.audit.start()
+                self.auth = AuthenticationManager(self.db, self.key_manager, self.key_cache, self.bus)
+            self.auth.initialize_master_password(password)
+            ok, msg = self.auth.authenticate(password)
+            if not ok:
+                messagebox.showerror("Ошибка", msg or "Не удалось открыть хранилище")
+                self.destroy()
+                return
+            self._load_test_data_if_empty()
+            self.state.mark_login()
+            self._set_status("unlocked")
             return
 
-        wizard = SetupWizard(self, self.cfg_mgr)
-        self.wait_window(wizard)
-        if wizard.result is None:
+        login = LoginDialog(self, self.auth)
+        self.wait_window(login)
+        if not login.success:
             self.destroy()
             return
-
-        db_path, master_password, kdf_params = wizard.result
-
-        if db_path != self.cfg.db_path:
-            self.cfg.db_path = db_path
-            self.cfg_mgr.save(self.cfg)
-            self.db = Database(self.cfg.db_path, pool_size=4)
-            self.db.initialize()
-            self.audit = AuditLogger(self.bus, self.db)
-            self.audit.start()
-
-        self.cfg.crypto.kdf_iterations = kdf_params.iterations
-        self.cfg.crypto.kdf_hash = kdf_params.hash_name
-        self.cfg.crypto.kdf_dklen = kdf_params.dklen
-        self.cfg_mgr.save(self.cfg)
-
-        self.km = KeyManager(params=kdf_params)
-        self.salt = secrets.token_bytes(16)
-        self.master_key = self.km.derive_key(master_password, self.salt)
-
-        self.db.upsert_setting("master_salt", self.salt, encrypted=False)
-        self._set_status("Первоначальная настройка завершена")
+        self.state.mark_login()
+        self._set_status("unlocked")
 
     def _load_test_data_if_empty(self) -> None:
-        rows = self.db.list_vault_entries()
-        if rows:
+        if self.db.list_vault_entries():
             return
-
-        if self.master_key is None:
-            self.master_key = AES256Placeholder.random_key(32)
         sample = [
             ("GitHub", "alice", "p@ssw0rd", "https://github.com", "note", "dev,work"),
-            ("Email", "alice@example.com", "secret123", "https://mail.example.com", "", "personal"),
-            ("Server", "root", "toor", "ssh://10.0.0.1", "rotate keys", "infra"),
+            ("Email", "alice@example.com", "secret123!!AA", "https://mail.example.com", "", "personal"),
+            ("Server", "root", "toor!!AA1122", "ssh://10.0.0.1", "rotate keys", "infra"),
         ]
         for title, user, pw, url, notes, tags in sample:
-            ct = self.crypto.encrypt(pw.encode("utf-8"), self.master_key)
+            ct = self.crypto.encrypt(pw.encode("utf-8"), self.auth)
             self.db.insert_vault_entry(title=title, username=user, encrypted_password=ct, url=url, notes=notes, tags=tags)
+
+    def _touch_activity(self) -> None:
+        self.state.touch_activity()
+        self.auth.touch_activity()
+        self.session_var.set("Сессия: active")
+
+    def _on_unmap(self, _event) -> None:
+        if self.key_cache.policy.clear_on_minimize:
+            self.auth.logout()
+            self.state.mark_logout()
+            self._set_status("locked")
+            messagebox.showinfo("Безопасность", "Хранилище заблокировано после сворачивания окна.")
+            self.destroy()
 
     def refresh_table(self) -> None:
         rows = self.db.list_vault_entries()
         self.table.set_rows(rows)
 
-
     def on_new(self) -> None:
-        messagebox.showinfo("Создать", "Заглушка: создание нового хранилища будет расширено в следующих спринтах.")
+        messagebox.showinfo("Создать", "Хранилище уже создано. Используйте отдельную БД для нового сейфа.")
 
     def on_open(self) -> None:
-        messagebox.showinfo("Открыть", "Заглушка: открытие/разблокировка хранилища будет расширено в следующих спринтах.")
+        messagebox.showinfo("Открыть", "Для Sprint 2 открытие выполняется при запуске приложения.")
 
-    def on_backup_stub(self) -> None:
-        messagebox.showinfo("Резервная копия", "Заглушка: backup/restore будут в Спринте 8.")
-
-    def on_exit(self) -> None:
-        try:
-            self.bus.publish(UserLoggedOut(username="local"))
-        except Exception:
-            pass
-        self.destroy()
+    def on_change_password(self) -> None:
+        ChangePasswordDialog(self, self.auth)
 
     def on_add_entry(self) -> None:
+        if not self.auth.get_encryption_key():
+            messagebox.showerror("Ошибка", "Хранилище заблокировано")
+            return
+
         win = tk.Toplevel(self)
         win.title("Добавить запись")
         win.geometry("520x360")
@@ -344,10 +401,7 @@ class MainWindow(tk.Tk):
                 messagebox.showerror("Ошибка", "Password: required")
                 return
 
-            if self.master_key is None:
-                self.master_key = AES256Placeholder.random_key(32)
-
-            ct = self.crypto.encrypt(password.encode("utf-8"), self.master_key)
+            ct = self.crypto.encrypt(password.encode("utf-8"), self.auth)
             entry_id = self.db.insert_vault_entry(
                 title=title_var.get().strip(),
                 username=user_var.get().strip(),
@@ -365,30 +419,21 @@ class MainWindow(tk.Tk):
         ttk.Button(btns, text="Отмена", command=win.destroy).pack(side="right")
         ttk.Button(btns, text="Сохранить", command=submit).pack(side="right", padx=(0, 8))
 
-    def on_edit_entry_stub(self) -> None:
-        messagebox.showinfo("Изменить", "Заглушка: редактирование будет расширено в следующих спринтах.")
-
-    def on_delete_entry_stub(self) -> None:
-        messagebox.showinfo("Удалить", "Заглушка: удаление будет расширено в следующих спринтах.")
-
-    def on_logs_stub(self) -> None:
-        messagebox.showinfo("Логи", "Заглушка: просмотр аудита будет в Спринте 5.")
-
     def on_settings(self) -> None:
         SettingsDialog(self)
 
     def on_about(self) -> None:
-        messagebox.showinfo(
-            "О программе",
-            "CryptoSafe Manager — Sprint 1\n"
-            "Фундамент: модульная архитектура, DB schema, crypto placeholders, EventBus, базовый GUI.",
-        )
+        messagebox.showinfo("О программе", "CryptoSafe Manager — Sprint 2\nArgon2id + PBKDF2 + login + password rotation.")
+
+    def on_exit(self) -> None:
+        self.auth.logout()
+        self.state.mark_logout()
+        self.destroy()
 
 
 def main() -> None:
     app = MainWindow()
     app.mainloop()
-
 
 if __name__ == "__main__":
     main()

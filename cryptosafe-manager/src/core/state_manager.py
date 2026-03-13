@@ -10,6 +10,8 @@ from typing import Optional
 class SessionState:
     locked: bool = True
     username: str = "local"
+    logged_in_at: Optional[float] = None
+    failed_attempts: int = 0
 
 
 @dataclass
@@ -22,11 +24,10 @@ class ClipboardState:
 @dataclass
 class IdleState:
     last_activity_at: float = 0.0
-    timeout_seconds: int = 0
+    timeout_seconds: int = 3600
 
 
 class StateManager:
-
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self.session = SessionState()
@@ -36,6 +37,22 @@ class StateManager:
     def set_locked(self, locked: bool) -> None:
         with self._lock:
             self.session.locked = bool(locked)
+
+    def mark_login(self) -> None:
+        with self._lock:
+            self.session.locked = False
+            self.session.logged_in_at = time.time()
+            self.session.failed_attempts = 0
+            self.idle.last_activity_at = time.time()
+
+    def mark_logout(self) -> None:
+        with self._lock:
+            self.session.locked = True
+            self.session.logged_in_at = None
+
+    def mark_failed_attempt(self) -> None:
+        with self._lock:
+            self.session.failed_attempts += 1
 
     def touch_activity(self) -> None:
         with self._lock:

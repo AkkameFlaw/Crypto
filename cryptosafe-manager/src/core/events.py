@@ -85,7 +85,7 @@ class EventBus:
             try:
                 h(event)
             except Exception:
-                # Do not leak details.
+
                 pass
 
         if async_handlers:

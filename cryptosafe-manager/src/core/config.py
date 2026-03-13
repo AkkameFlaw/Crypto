@@ -1,13 +1,11 @@
 from __future__ import annotations
-from dataclasses import dataclass, asdict, field
-
 
 import json
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, Optional
 
-from .utils import minimal_path_permissions
+from src.core.utils import minimal_path_permissions
 
 
 def _default_config_dir() -> str:
@@ -21,9 +19,15 @@ def _default_config_dir() -> str:
 
 @dataclass
 class CryptoConfig:
-    kdf_iterations: int = 120_000
-    kdf_hash: str = "sha256"
-    kdf_dklen: int = 32
+    argon2_time: int = 3
+    argon2_memory: int = 65536
+    argon2_parallelism: int = 4
+    argon2_hash_len: int = 32
+    argon2_salt_len: int = 16
+
+    pbkdf2_iterations: int = 100000
+    pbkdf2_salt_len: int = 16
+    pbkdf2_dklen: int = 32
 
 
 @dataclass
@@ -32,15 +36,13 @@ class AppConfig:
     db_path: str = ""
     config_dir: str = ""
     crypto: CryptoConfig = field(default_factory=CryptoConfig)
-
     clipboard_timeout_seconds: int = 0
-    auto_lock_seconds: int = 0
+    auto_lock_seconds: int = 3600
     language: str = "ru"
     theme: str = "system"
 
 
 class ConfigManager:
-
     def __init__(self, env: str = "development") -> None:
         env = env if env in ("development", "production") else "development"
         self.env = env
@@ -68,9 +70,8 @@ class ConfigManager:
 
     def save(self, cfg: AppConfig) -> None:
         os.makedirs(self.config_dir, exist_ok=True)
-        data = asdict(cfg)
         with open(self.config_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump(asdict(cfg), f, indent=2, ensure_ascii=False)
         minimal_path_permissions(self.config_path)
 
     @staticmethod
@@ -81,19 +82,22 @@ class ConfigManager:
             db_path=str(d.get("db_path", "")),
             config_dir=str(d.get("config_dir", "")),
             crypto=CryptoConfig(
-                kdf_iterations=int(crypto.get("kdf_iterations", 120_000)),
-                kdf_hash=str(crypto.get("kdf_hash", "sha256")),
-                kdf_dklen=int(crypto.get("kdf_dklen", 32)),
+                argon2_time=int(crypto.get("argon2_time", 3)),
+                argon2_memory=int(crypto.get("argon2_memory", 65536)),
+                argon2_parallelism=int(crypto.get("argon2_parallelism", 4)),
+                argon2_hash_len=int(crypto.get("argon2_hash_len", 32)),
+                argon2_salt_len=int(crypto.get("argon2_salt_len", 16)),
+                pbkdf2_iterations=int(crypto.get("pbkdf2_iterations", 100000)),
+                pbkdf2_salt_len=int(crypto.get("pbkdf2_salt_len", 16)),
+                pbkdf2_dklen=int(crypto.get("pbkdf2_dklen", 32)),
             ),
             clipboard_timeout_seconds=int(d.get("clipboard_timeout_seconds", 0)),
-            auto_lock_seconds=int(d.get("auto_lock_seconds", 0)),
+            auto_lock_seconds=int(d.get("auto_lock_seconds", 3600)),
             language=str(d.get("language", "ru")),
             theme=str(d.get("theme", "system")),
         )
-
         if not cfg.config_dir:
             cfg.config_dir = _default_config_dir()
-
         if not cfg.db_path:
             cfg.db_path = os.path.join(cfg.config_dir, "vault.sqlite3")
         return cfg

@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import secrets
-from .abstract import EncryptionService
+
+from src.core.crypto.abstract import EncryptionService
 
 
 class AES256Placeholder(EncryptionService):
 
-    def encrypt(self, data: bytes, key: bytes) -> bytes:
+    def encrypt(self, data: bytes, auth_manager) -> bytes:
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("data must be bytes")
+        key = auth_manager.get_encryption_key()
         if not key:
-            raise ValueError("key is empty")
+            raise ValueError("vault is locked")
         return self._xor(data, key)
 
-    def decrypt(self, ciphertext: bytes, key: bytes) -> bytes:
+    def decrypt(self, ciphertext: bytes, auth_manager) -> bytes:
         if not isinstance(ciphertext, (bytes, bytearray)):
             raise TypeError("ciphertext must be bytes")
+        key = auth_manager.get_encryption_key()
         if not key:
-            raise ValueError("key is empty")
+            raise ValueError("vault is locked")
         return self._xor(ciphertext, key)
 
     @staticmethod

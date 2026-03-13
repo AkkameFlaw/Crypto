@@ -6,12 +6,13 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Iterator, Optional, Tuple
 
-from ..core.utils import minimal_path_permissions
+from src.core.crypto.placeholder import AES256Placeholder
+from src.core.utils import minimal_path_permissions
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class DatabaseError(Exception):
@@ -19,7 +20,6 @@ class DatabaseError(Exception):
 
 
 class Database:
-
     def __init__(self, path: str, pool_size: int = 4, timeout: float = 5.0) -> None:
         self.path = path
         self.pool_size = max(1, int(pool_size))
@@ -66,11 +66,15 @@ class Database:
 
         if current == 0:
             self._migration_0_to_1(conn)
-            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION};")
+            conn.execute("PRAGMA user_version=1;")
+            current = 1
 
-        elif current == SCHEMA_VERSION:
-            return
-        else:
+        if current == 1:
+            self._migration_1_to_2(conn)
+            conn.execute("PRAGMA user_version=2;")
+            current = 2
+
+        if current != SCHEMA_VERSION:
             raise DatabaseError("Unsupported database schema version")
 
     def _migration_0_to_1(self, conn: sqlite3.Connection) -> None:
@@ -134,6 +138,53 @@ class Database:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_key_store_type ON key_store(key_type);")
+            conn.execute("COMMIT;")
+        except Exception:
+            conn.execute("ROLLBACK;")
+            raise
+
+    def _migration_1_to_2(self, conn: sqlite3.Connection) -> None:
+        conn.execute("BEGIN;")
+        try:
+            conn.execute("ALTER TABLE key_store RENAME TO key_store_old;")
+
+            conn.execute(
+                """
+                CREATE TABLE key_store (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key_type TEXT NOT NULL UNIQUE,
+                    key_data BLOB NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_key_store_type_v2 ON key_store(key_type);")
+            now = int(time.time())
+
+            old_exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='key_store_old';"
+            ).fetchone()
+            if old_exists:
+                rows = conn.execute("SELECT key_type, salt, hash, params FROM key_store_old;").fetchall()
+                for r in rows:
+                    # best-effort migration from old shape
+                    if r["hash"]:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO key_store(key_type, key_data, version, created_at) VALUES (?, ?, ?, ?);",
+                            ("auth_hash", r["hash"], 1, now),
+                        )
+                    if r["salt"]:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO key_store(key_type, key_data, version, created_at) VALUES (?, ?, ?, ?);",
+                            ("enc_salt", r["salt"], 1, now),
+                        )
+                    if r["params"]:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO key_store(key_type, key_data, version, created_at) VALUES (?, ?, ?, ?);",
+                            ("params", r["params"].encode("utf-8"), 1, now),
+                        )
+                conn.execute("DROP TABLE key_store_old;")
 
             conn.execute("COMMIT;")
         except Exception:
@@ -154,7 +205,6 @@ class Database:
         finally:
             if conn is not None:
                 self._pool.put(conn)
-
 
     def insert_vault_entry(
         self,
@@ -177,9 +227,9 @@ class Database:
                     """,
                     (title, username, sqlite3.Binary(encrypted_password), url, notes, now, now, tags),
                 )
-                entry_id = int(cur.lastrowid)
+                rid = int(cur.lastrowid)
                 conn.execute("COMMIT;")
-                return entry_id
+                return rid
             except Exception:
                 conn.execute("ROLLBACK;")
                 raise
@@ -190,6 +240,23 @@ class Database:
                 "SELECT id, title, username, url, notes, created_at, updated_at, tags FROM vault_entries ORDER BY updated_at DESC;"
             )
             return [dict(r) for r in cur.fetchall()]
+
+    def list_vault_entries_with_ciphertext(self) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, title, username, encrypted_password, url, notes, created_at, updated_at, tags
+                FROM vault_entries ORDER BY id ASC;
+                """
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def update_entry_ciphertext(self, entry_id: int, encrypted_password: bytes) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE vault_entries SET encrypted_password=?, updated_at=? WHERE id=?;",
+                (sqlite3.Binary(encrypted_password), int(time.time()), int(entry_id)),
+            )
 
     def insert_audit_log(
         self,
@@ -237,6 +304,51 @@ class Database:
                 return None
             return (bytes(row["setting_value"]), int(row["encrypted"]))
 
+    def set_keystore_value(self, key_type: str, key_data: bytes, version: int = 1) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO key_store(key_type, key_data, version, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(key_type) DO UPDATE SET
+                    key_data=excluded.key_data,
+                    version=excluded.version,
+                    created_at=excluded.created_at;
+                """,
+                (key_type, sqlite3.Binary(key_data), int(version), int(time.time())),
+            )
+
+    def get_keystore_value(self, key_type: str) -> Optional[bytes]:
+        with self.connection() as conn:
+            cur = conn.execute("SELECT key_data FROM key_store WHERE key_type=?;", (key_type,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return bytes(row["key_data"])
+
+    def rotate_vault_keys_atomic(self, old_key: bytes, new_key: bytes, progress_callback=None) -> None:
+        crypto = AES256Placeholder()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                rows = conn.execute(
+                    "SELECT id, encrypted_password FROM vault_entries ORDER BY id ASC;"
+                ).fetchall()
+                total = len(rows)
+                for idx, row in enumerate(rows, start=1):
+                    ct = bytes(row["encrypted_password"])
+                    old_pt = AES256Placeholder._xor(ct, old_key)
+                    new_ct = AES256Placeholder._xor(old_pt, new_key)
+                    conn.execute(
+                        "UPDATE vault_entries SET encrypted_password=?, updated_at=? WHERE id=?;",
+                        (sqlite3.Binary(new_ct), int(time.time()), int(row["id"])),
+                    )
+                    if progress_callback:
+                        progress_callback(idx, total)
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
 
     def backup(self, *_args, **_kwargs) -> None:
         raise NotImplementedError("Backup will be implemented in Sprint 8")
