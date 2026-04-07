@@ -8,11 +8,10 @@ import time
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional, Tuple
 
-from src.core.crypto.placeholder import AES256Placeholder
 from src.core.utils import minimal_path_permissions
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class DatabaseError(Exception):
@@ -46,6 +45,22 @@ class Database:
             minimal_path_permissions(self.path)
             self._initialized = True
 
+    def close(self) -> None:
+        if not self._initialized:
+            return
+
+        while not self._pool.empty():
+            try:
+                conn = self._pool.get_nowait()
+            except Exception:
+                break
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        self._initialized = False
+
     def _new_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
             self.path,
@@ -73,6 +88,11 @@ class Database:
             self._migration_1_to_2(conn)
             conn.execute("PRAGMA user_version=2;")
             current = 2
+
+        if current == 2:
+            self._migration_2_to_3(conn)
+            conn.execute("PRAGMA user_version=3;")
+            current = 3
 
         if current != SCHEMA_VERSION:
             raise DatabaseError("Unsupported database schema version")
@@ -168,7 +188,6 @@ class Database:
             if old_exists:
                 rows = conn.execute("SELECT key_type, salt, hash, params FROM key_store_old;").fetchall()
                 for r in rows:
-                    # best-effort migration from old shape
                     if r["hash"]:
                         conn.execute(
                             "INSERT OR REPLACE INTO key_store(key_type, key_data, version, created_at) VALUES (?, ?, ?, ?);",
@@ -185,6 +204,40 @@ class Database:
                             ("params", r["params"].encode("utf-8"), 1, now),
                         )
                 conn.execute("DROP TABLE key_store_old;")
+
+            conn.execute("COMMIT;")
+        except Exception:
+            conn.execute("ROLLBACK;")
+            raise
+
+    def _migration_2_to_3(self, conn: sqlite3.Connection) -> None:
+        conn.execute("BEGIN;")
+        try:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(vault_entries);").fetchall()}
+
+            if "encrypted_data" not in cols:
+                conn.execute("ALTER TABLE vault_entries ADD COLUMN encrypted_data BLOB NULL;")
+            if "category" not in cols:
+                conn.execute("ALTER TABLE vault_entries ADD COLUMN category TEXT NOT NULL DEFAULT '';")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_entries_created_at ON vault_entries(created_at);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_entries_updated_at_v3 ON vault_entries(updated_at);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_entries_tags ON vault_entries(tags);")
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS deleted_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_entry_id INTEGER NOT NULL,
+                    encrypted_data BLOB NULL,
+                    tags TEXT NOT NULL DEFAULT '',
+                    deleted_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_entries_original_entry_id ON deleted_entries(original_entry_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_entries_expires_at ON deleted_entries(expires_at);")
 
             conn.execute("COMMIT;")
         except Exception:
@@ -222,8 +275,8 @@ class Database:
                 cur = conn.execute(
                     """
                     INSERT INTO vault_entries
-                    (title, username, encrypted_password, url, notes, created_at, updated_at, tags)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    (title, username, encrypted_password, url, notes, created_at, updated_at, tags, category, encrypted_data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', NULL);
                     """,
                     (title, username, sqlite3.Binary(encrypted_password), url, notes, now, now, tags),
                 )
@@ -233,6 +286,108 @@ class Database:
             except Exception:
                 conn.execute("ROLLBACK;")
                 raise
+
+    def insert_vault_entry_v3(self, encrypted_data: bytes, created_at: int, updated_at: int, tags: str = "") -> int:
+        with self.connection() as conn:
+            conn.execute("BEGIN;")
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT INTO vault_entries
+                    (title, username, encrypted_password, url, notes, created_at, updated_at, tags, category, encrypted_data)
+                    VALUES ('', '', ?, '', '', ?, ?, ?, '', ?);
+                    """,
+                    (
+                        sqlite3.Binary(b""),
+                        int(created_at),
+                        int(updated_at),
+                        tags,
+                        sqlite3.Binary(encrypted_data),
+                    ),
+                )
+                rid = int(cur.lastrowid)
+                conn.execute("COMMIT;")
+                return rid
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def get_vault_row(self, entry_id: int) -> Optional[dict[str, Any]]:
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, title, username, encrypted_password, encrypted_data, url, notes, category, created_at, updated_at, tags
+                FROM vault_entries WHERE id=?;
+                """,
+                (int(entry_id),),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def list_vault_rows_v3(self) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, title, username, encrypted_password, encrypted_data, url, notes, category, created_at, updated_at, tags
+                FROM vault_entries
+                ORDER BY updated_at DESC;
+                """
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def update_vault_entry_v3(self, entry_id: int, encrypted_data: bytes, updated_at: int, tags: str = "") -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN;")
+            try:
+                conn.execute(
+                    """
+                    UPDATE vault_entries
+                    SET encrypted_data=?, updated_at=?, tags=?
+                    WHERE id=?;
+                    """,
+                    (sqlite3.Binary(encrypted_data), int(updated_at), tags, int(entry_id)),
+                )
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def soft_delete_vault_entry(self, entry_id: int, retention_days: int = 30) -> None:
+        now = int(time.time())
+        expires_at = now + retention_days * 24 * 3600
+        with self.connection() as conn:
+            conn.execute("BEGIN;")
+            try:
+                row = conn.execute(
+                    "SELECT id, encrypted_data, tags FROM vault_entries WHERE id=?;",
+                    (int(entry_id),),
+                ).fetchone()
+                if not row:
+                    conn.execute("ROLLBACK;")
+                    return
+
+                conn.execute(
+                    """
+                    INSERT INTO deleted_entries(original_entry_id, encrypted_data, tags, deleted_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?);
+                    """,
+                    (
+                        int(row["id"]),
+                        sqlite3.Binary(row["encrypted_data"]) if row["encrypted_data"] is not None else None,
+                        row["tags"] or "",
+                        now,
+                        expires_at,
+                    ),
+                )
+                conn.execute("DELETE FROM vault_entries WHERE id=?;", (int(entry_id),))
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def hard_delete_vault_entry(self, entry_id: int) -> None:
+        with self.connection() as conn:
+            conn.execute("DELETE FROM vault_entries WHERE id=?;", (int(entry_id),))
 
     def list_vault_entries(self) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -245,18 +400,11 @@ class Database:
         with self.connection() as conn:
             cur = conn.execute(
                 """
-                SELECT id, title, username, encrypted_password, url, notes, created_at, updated_at, tags
+                SELECT id, title, username, encrypted_password, encrypted_data, url, notes, category, created_at, updated_at, tags
                 FROM vault_entries ORDER BY id ASC;
                 """
             )
             return [dict(r) for r in cur.fetchall()]
-
-    def update_entry_ciphertext(self, entry_id: int, encrypted_password: bytes) -> None:
-        with self.connection() as conn:
-            conn.execute(
-                "UPDATE vault_entries SET encrypted_password=?, updated_at=? WHERE id=?;",
-                (sqlite3.Binary(encrypted_password), int(time.time()), int(entry_id)),
-            )
 
     def insert_audit_log(
         self,
@@ -325,30 +473,6 @@ class Database:
             if not row:
                 return None
             return bytes(row["key_data"])
-
-    def rotate_vault_keys_atomic(self, old_key: bytes, new_key: bytes, progress_callback=None) -> None:
-        crypto = AES256Placeholder()
-        with self.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE;")
-            try:
-                rows = conn.execute(
-                    "SELECT id, encrypted_password FROM vault_entries ORDER BY id ASC;"
-                ).fetchall()
-                total = len(rows)
-                for idx, row in enumerate(rows, start=1):
-                    ct = bytes(row["encrypted_password"])
-                    old_pt = AES256Placeholder._xor(ct, old_key)
-                    new_ct = AES256Placeholder._xor(old_pt, new_key)
-                    conn.execute(
-                        "UPDATE vault_entries SET encrypted_password=?, updated_at=? WHERE id=?;",
-                        (sqlite3.Binary(new_ct), int(time.time()), int(row["id"])),
-                    )
-                    if progress_callback:
-                        progress_callback(idx, total)
-                conn.execute("COMMIT;")
-            except Exception:
-                conn.execute("ROLLBACK;")
-                raise
 
     def backup(self, *_args, **_kwargs) -> None:
         raise NotImplementedError("Backup will be implemented in Sprint 8")

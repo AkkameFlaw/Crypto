@@ -14,6 +14,7 @@ def temp_db_path():
 
 @pytest.fixture()
 def db(temp_db_path):
-    db = Database(temp_db_path, pool_size=2)
-    db.initialize()
-    return db
+    database = Database(temp_db_path, pool_size=2)
+    database.initialize()
+    yield database
+    database.close()

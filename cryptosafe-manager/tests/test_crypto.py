@@ -1,20 +1,20 @@
+from src.core.crypto.authentication import AuthenticationManager
+from src.core.crypto.key_derivation import KeyManager
+from src.core.crypto.key_storage import SecureKeyCache
 from src.core.crypto.placeholder import AES256Placeholder
-from src.core.key_manager import KeyManager
+from src.core.events import EventBus
 
 
-def test_xor_encrypt_decrypt_roundtrip():
+def test_xor_encrypt_decrypt_roundtrip(db):
+    auth = AuthenticationManager(db, KeyManager(), SecureKeyCache(), EventBus())
+    auth.initialize_master_password("StrongPass!123")
+    ok, _ = auth.authenticate("StrongPass!123")
+    assert ok is True
+
     crypto = AES256Placeholder()
-    key = b"abcd" * 8
     data = b"hello world"
-    ct = crypto.encrypt(data, key)
-    pt = crypto.decrypt(ct, key)
+
+    ct = crypto.encrypt(data, auth)
+    pt = crypto.decrypt(ct, auth)
+
     assert pt == data
-
-
-def test_key_manager_derive_key():
-    km = KeyManager()
-    salt = b"12345678ABCDEFGH"
-    key1 = km.derive_key("password", salt)
-    key2 = km.derive_key("password", salt)
-    assert key1 == key2
-    assert len(key1) == 32

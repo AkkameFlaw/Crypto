@@ -92,7 +92,9 @@ class ConfigManager:
                 pbkdf2_dklen=int(crypto.get("pbkdf2_dklen", 32)),
             ),
             clipboard_timeout_seconds=int(d.get("clipboard_timeout_seconds", 0)),
-            auto_lock_seconds=int(d.get("auto_lock_seconds", 3600)),
+            raw_auto_lock=int(d.get("auto_lock_seconds", 3600) or 0),
+            auto_lock = raw_auto_lock if raw_auto_lock > 0 else 3600,
+            auto_lock_seconds=auto_lock,
             language=str(d.get("language", "ru")),
             theme=str(d.get("theme", "system")),
         )
