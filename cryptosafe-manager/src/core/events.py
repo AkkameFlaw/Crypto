@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import threading
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Dict, List, Type
+from typing import Awaitable, Callable, Dict, List, Optional, Type
 
 
 @dataclass(frozen=True)
@@ -44,12 +44,15 @@ class UserLoggedOut(Event):
 
 @dataclass(frozen=True)
 class ClipboardCopied(Event):
-    entry_id: int
+    entry_id: Optional[int] = None
+    data_type: str = "text"
+    timeout_seconds: int = 30
 
 
 @dataclass(frozen=True)
 class ClipboardCleared(Event):
-    entry_id: int
+    entry_id: Optional[int] = None
+    reason: str = "manual"
 
 
 SyncHandler = Callable[[Event], None]
@@ -65,16 +68,13 @@ class EventBus:
     def subscribe(self, event_type: Type[Event], handler: SyncHandler | AsyncHandler) -> None:
         with self._lock:
             if inspect.iscoroutinefunction(handler):
-                self._async.setdefault(event_type, []).append(handler)
+                self._async.setdefault(event_type, []).append(handler)  # type: ignore[arg-type]
             else:
-                self._sync.setdefault(event_type, []).append(handler)
+                self._sync.setdefault(event_type, []).append(handler)  # type: ignore[arg-type]
 
     def unsubscribe(self, event_type: Type[Event], handler: SyncHandler | AsyncHandler) -> None:
         with self._lock:
-            if inspect.iscoroutinefunction(handler):
-                handlers = self._async.get(event_type, [])
-            else:
-                handlers = self._sync.get(event_type, [])
+            handlers = self._async.get(event_type, []) if inspect.iscoroutinefunction(handler) else self._sync.get(event_type, [])
             if handler in handlers:
                 handlers.remove(handler)
 

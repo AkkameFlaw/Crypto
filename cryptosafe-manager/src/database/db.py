@@ -8,6 +8,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional, Tuple
 
+from src.core.crypto.placeholder import AES256Placeholder
 from src.core.utils import minimal_path_permissions
 
 
@@ -405,6 +406,31 @@ class Database:
                 """
             )
             return [dict(r) for r in cur.fetchall()]
+
+    def rotate_vault_keys_atomic(self, old_key: bytes, new_key: bytes, progress_callback=None) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                rows = conn.execute(
+                    "SELECT id, encrypted_password FROM vault_entries WHERE encrypted_password IS NOT NULL ORDER BY id ASC;"
+                ).fetchall()
+                total = len(rows)
+
+                for idx, row in enumerate(rows, start=1):
+                    ct = bytes(row["encrypted_password"])
+                    old_pt = AES256Placeholder._xor(ct, old_key)
+                    new_ct = AES256Placeholder._xor(old_pt, new_key)
+                    conn.execute(
+                        "UPDATE vault_entries SET encrypted_password=?, updated_at=? WHERE id=?;",
+                        (sqlite3.Binary(new_ct), int(time.time()), int(row["id"])),
+                    )
+                    if progress_callback:
+                        progress_callback(idx, total)
+
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
 
     def insert_audit_log(
         self,
