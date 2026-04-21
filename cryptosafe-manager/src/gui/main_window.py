@@ -301,7 +301,7 @@ class MainWindow(tk.Tk):
         self.cfg_mgr = ConfigManager(env=os.getenv("CRYPTOSAFE_ENV", "development"))
         self.cfg = self.cfg_mgr.load()
 
-        self.db = Database(self.cfg.db_path, pool_size=4)
+        self.db = Database(self.cfg.db_path, pool_size=8)
         self.db.initialize()
 
         self.key_manager = KeyManager(

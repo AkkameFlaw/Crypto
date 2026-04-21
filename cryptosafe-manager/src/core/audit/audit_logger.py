@@ -6,6 +6,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from src.core.audit.log_signer import AuditLogSigner
 from src.core.events import (
     ClipboardCleared,
     ClipboardCopied,
@@ -17,11 +18,9 @@ from src.core.events import (
     UserLoggedIn,
     UserLoggedOut,
 )
-from src.core.audit.log_signer import AuditLogSigner
 
 
 class AuditLogger:
-
     REDACT_KEYS = {
         "password",
         "master_password",
@@ -40,6 +39,7 @@ class AuditLogger:
         self.user_id = user_id
         self.signer = AuditLogSigner(auth_manager)
         self._buffer: deque[tuple[str, str, str, dict, Optional[int]]] = deque(maxlen=500)
+        self._genesis_in_progress = False
 
     def start(self) -> None:
         for evt in (
@@ -58,16 +58,51 @@ class AuditLogger:
         if not self.signer.is_ready():
             return False
 
-        if self.db.count_audit_entries() == 0:
-            self.log_event(
-                event_type="SYSTEM_GENESIS",
-                severity="INFO",
-                source="audit_logger",
-                details={"message": "Audit log initialized"},
-                entry_id=None,
-                internal=True,
-            )
+        if self.db.count_audit_entries() == 0 and not self._genesis_in_progress:
+            self._genesis_in_progress = True
+            try:
+                self._write_genesis_entry()
+            finally:
+                self._genesis_in_progress = False
+
         return True
+
+    def _write_genesis_entry(self) -> None:
+        timestamp_utc = datetime.now(timezone.utc).isoformat()
+        sequence_number = 0
+        previous_hash = "0" * 64
+
+        entry = {
+            "timestamp": timestamp_utc,
+            "event_type": "SYSTEM_GENESIS",
+            "severity": "INFO",
+            "user_id": "system",
+            "source": "audit_logger",
+            "details": {"message": "Audit log initialized"},
+            "entry_id": None,
+            "sequence_number": sequence_number,
+            "previous_hash": previous_hash,
+        }
+
+        entry_json = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        entry_hash = hashlib.sha256(entry_json.encode("utf-8")).hexdigest()
+        sign_result = self.signer.sign(entry_json.encode("utf-8"))
+
+        self.db.insert_audit_entry(
+            sequence_number=sequence_number,
+            previous_hash=previous_hash,
+            timestamp_utc=timestamp_utc,
+            event_type="SYSTEM_GENESIS",
+            severity="INFO",
+            user_id="system",
+            source="audit_logger",
+            entry_id=None,
+            entry_data=entry_json.encode("utf-8"),
+            entry_hash=entry_hash,
+            signature=sign_result.signature_hex,
+            public_key=sign_result.public_key_b64,
+            signing_mode=sign_result.mode,
+        )
 
     def flush_buffer(self) -> None:
         if not self._ensure_initialized():
@@ -136,6 +171,8 @@ class AuditLogger:
 
     def verify_integrity(self, start_seq: int = 0, end_seq: Optional[int] = None) -> dict[str, Any]:
         rows = self.db.fetch_audit_entries(start_seq=start_seq, end_seq=end_seq)
+        rows = sorted(rows, key=lambda r: int(r["sequence_number"]))
+
         results = {
             "total_entries": len(rows),
             "valid_entries": 0,
@@ -146,8 +183,8 @@ class AuditLogger:
 
         previous_hash = None
 
-        for row in rows:
-            seq = row["sequence_number"]
+        for index, row in enumerate(rows):
+            seq = int(row["sequence_number"])
             entry_data = bytes(row["entry_data"]).decode("utf-8", errors="ignore")
             entry_hash = row["entry_hash"] or ""
             previous_row_hash = row["previous_hash"] or ""
@@ -166,11 +203,25 @@ class AuditLogger:
                 results["verified"] = False
                 continue
 
-            if previous_hash is not None and previous_row_hash != previous_hash:
-                results["chain_breaks"].append(
-                    {"sequence": seq, "expected": previous_hash, "actual": previous_row_hash}
-                )
-                results["verified"] = False
+            if index == 0:
+                if seq == 0:
+                    if previous_row_hash != ("0" * 64):
+                        results["chain_breaks"].append(
+                            {"sequence": seq, "expected": "0" * 64, "actual": previous_row_hash}
+                        )
+                        results["verified"] = False
+                else:
+                    if previous_hash is not None and previous_row_hash != previous_hash:
+                        results["chain_breaks"].append(
+                            {"sequence": seq, "expected": previous_hash, "actual": previous_row_hash}
+                        )
+                        results["verified"] = False
+            else:
+                if previous_row_hash != previous_hash:
+                    results["chain_breaks"].append(
+                        {"sequence": seq, "expected": previous_hash, "actual": previous_row_hash}
+                    )
+                    results["verified"] = False
 
             results["valid_entries"] += 1
             previous_hash = entry_hash

@@ -286,14 +286,32 @@ class Database:
             self.initialize()
 
         conn = None
+        pooled = True
+
         try:
-            conn = self._pool.get(timeout=self.timeout)
+            try:
+                conn = self._pool.get(timeout=self.timeout)
+            except queue.Empty:
+                conn = self._new_connection()
+                pooled = False
+
             yield conn
-        except queue.Empty as e:
-            raise DatabaseError("DB connection pool exhausted") from e
+
         finally:
             if conn is not None:
-                self._pool.put(conn)
+                if pooled:
+                    try:
+                        self._pool.put(conn, timeout=self.timeout)
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
 
     def insert_vault_entry(
