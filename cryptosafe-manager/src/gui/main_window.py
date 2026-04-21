@@ -15,7 +15,7 @@ from src.core.events import EventBus
 from src.core.state_manager import StateManager
 from src.core.vault import AESGCMEntryEncryptionService, EntryManager, PasswordGenerator, PasswordGeneratorOptions
 from src.database.db import Database
-from src.gui.widgets import PasswordEntry, SecureTable, SettingsDialog
+from src.gui.widgets import PasswordEntry, SecureTable, SettingsDialog, AuditLogViewer
 
 
 class SetupWizard(tk.Toplevel):
@@ -293,7 +293,7 @@ class ChangePasswordDialog(tk.Toplevel):
 class MainWindow(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("CryptoSafe Manager (Sprint 4)")
+        self.title("CryptoSafe Manager (Sprint 5)")
         self.geometry("1120x690")
 
         self.bus = EventBus()
@@ -328,7 +328,7 @@ class MainWindow(tk.Tk):
         self.entry_manager = EntryManager(self.db, self.entry_encryption, self.bus)
         self.password_generator = PasswordGenerator()
 
-        self.audit = AuditLogger(self.bus, self.db)
+        self.audit = AuditLogger(self.bus, self.db, self.auth)
         self.audit.start()
 
         self._current_rows: list[dict] = []
@@ -386,6 +386,7 @@ class MainWindow(tk.Tk):
         view_menu = tk.Menu(menubar, tearoff=0)
         view_menu.add_command(label="Показать/скрыть пароли", command=self.toggle_passwords)
         view_menu.add_command(label="Настройки", command=self.on_settings)
+        view_menu.add_command(label="Audit Log", command=self.on_audit_log)
 
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="О программе", command=self.on_about)
@@ -461,11 +462,11 @@ class MainWindow(tk.Tk):
                 self.cfg_mgr.save(self.cfg)
                 self.db = Database(self.cfg.db_path, pool_size=4)
                 self.db.initialize()
-                self.audit = AuditLogger(self.bus, self.db)
-                self.audit.start()
                 self.auth = AuthenticationManager(self.db, self.key_manager, self.key_cache, self.bus)
                 self.entry_encryption = AESGCMEntryEncryptionService(self.auth)
                 self.entry_manager = EntryManager(self.db, self.entry_encryption, self.bus)
+                self.audit = AuditLogger(self.bus, self.db, self.auth)
+                self.audit.start()
 
             try:
                 self.auth.initialize_master_password(password)
@@ -662,10 +663,16 @@ class MainWindow(tk.Tk):
         self._save_clipboard_timeout(value)
         self._show_toast("Настройка буфера обмена сохранена")
 
+    def on_audit_log(self) -> None:
+        if not self.auth.get_encryption_key():
+            messagebox.showerror("Ошибка", "Хранилище заблокировано")
+            return
+        AuditLogViewer(self, self.db, self.audit)
+
     def on_about(self) -> None:
         messagebox.showinfo(
             "О программе",
-            "CryptoSafe Manager — Sprint 4\nSecure clipboard, auto-clear, monitoring и интеграция с хранилищем.",
+            "CryptoSafe Manager — Sprint 5\nAudit logging, secure clipboard, AES-GCM vault and key management.",
         )
 
     def _show_toast(self, text: str) -> None:
@@ -692,7 +699,7 @@ class MainWindow(tk.Tk):
         data_type = status.get("data_type", "text")
         self.clipboard_var.set(f"Буфер: {data_type} | {preview} | {remaining}s")
 
-    def _on_clipboard_suspicious_activity(self, message: str) -> None:
+    def _on_clipboard_suspicious_activity(self, _message: str) -> None:
         self._show_toast("Внимание: буфер обмена изменён извне")
         self.clipboard_var.set("Буфер: подозрительная активность")
 

@@ -12,7 +12,7 @@ from src.core.crypto.placeholder import AES256Placeholder
 from src.core.utils import minimal_path_permissions
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class DatabaseError(Exception):
@@ -94,6 +94,11 @@ class Database:
             self._migration_2_to_3(conn)
             conn.execute("PRAGMA user_version=3;")
             current = 3
+
+        if current == 3:
+            self._migration_3_to_4(conn)
+            conn.execute("PRAGMA user_version=4;")
+            current = 4
 
         if current != SCHEMA_VERSION:
             raise DatabaseError("Unsupported database schema version")
@@ -245,6 +250,36 @@ class Database:
             conn.execute("ROLLBACK;")
             raise
 
+    def _migration_3_to_4(self, conn: sqlite3.Connection) -> None:
+        conn.execute("BEGIN;")
+        try:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(audit_log);").fetchall()}
+
+            def add_col(name: str, ddl: str) -> None:
+                if name not in cols:
+                    conn.execute(f"ALTER TABLE audit_log ADD COLUMN {ddl};")
+
+            add_col("sequence_number", "sequence_number INTEGER")
+            add_col("previous_hash", "previous_hash TEXT")
+            add_col("entry_data", "entry_data BLOB")
+            add_col("entry_hash", "entry_hash TEXT")
+            add_col("public_key", "public_key TEXT")
+            add_col("signing_mode", "signing_mode TEXT")
+            add_col("event_type", "event_type TEXT")
+            add_col("severity", "severity TEXT DEFAULT 'INFO'")
+            add_col("user_id", "user_id TEXT DEFAULT 'local-user'")
+            add_col("source", "source TEXT DEFAULT 'legacy'")
+            add_col("timestamp_utc", "timestamp_utc TEXT")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_sequence_number ON audit_log(sequence_number);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_event_type ON audit_log(event_type);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp_utc ON audit_log(timestamp_utc);")
+
+            conn.execute("COMMIT;")
+        except Exception:
+            conn.execute("ROLLBACK;")
+            raise
+
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         if not self._initialized:
@@ -259,6 +294,7 @@ class Database:
         finally:
             if conn is not None:
                 self._pool.put(conn)
+
 
     def insert_vault_entry(
         self,
@@ -456,6 +492,126 @@ class Database:
             except Exception:
                 conn.execute("ROLLBACK;")
                 raise
+
+    def count_audit_entries(self) -> int:
+        with self.connection() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM audit_log WHERE sequence_number IS NOT NULL;").fetchone()
+            return int(row["c"]) if row else 0
+
+    def get_last_audit_sequence(self) -> int:
+        with self.connection() as conn:
+            row = conn.execute("SELECT MAX(sequence_number) AS seq FROM audit_log;").fetchone()
+            return int(row["seq"]) if row and row["seq"] is not None else -1
+
+    def get_next_audit_sequence(self) -> int:
+        return self.get_last_audit_sequence() + 1
+
+    def get_last_audit_hash(self) -> Optional[str]:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT entry_hash FROM audit_log WHERE sequence_number IS NOT NULL ORDER BY sequence_number DESC LIMIT 1;"
+            ).fetchone()
+            return str(row["entry_hash"]) if row and row["entry_hash"] else None
+
+    def insert_audit_entry(
+        self,
+        sequence_number: int,
+        previous_hash: str,
+        timestamp_utc: str,
+        event_type: str,
+        severity: str,
+        user_id: str,
+        source: str,
+        entry_id: Optional[int],
+        entry_data: bytes,
+        entry_hash: str,
+        signature: str,
+        public_key: str,
+        signing_mode: str,
+    ) -> int:
+        with self.connection() as conn:
+            conn.execute("BEGIN;")
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT INTO audit_log
+                    (
+                        sequence_number, previous_hash, entry_data, entry_hash, signature,
+                        public_key, signing_mode, event_type, severity, user_id, source,
+                        timestamp_utc, entry_id, action, timestamp, details
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        int(sequence_number),
+                        previous_hash,
+                        sqlite3.Binary(entry_data),
+                        entry_hash,
+                        signature,
+                        public_key,
+                        signing_mode,
+                        event_type,
+                        severity,
+                        user_id,
+                        source,
+                        timestamp_utc,
+                        entry_id,
+                        event_type,
+                        int(time.time()),
+                        "",
+                    ),
+                )
+                rid = int(cur.lastrowid)
+                conn.execute("COMMIT;")
+                return rid
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def fetch_audit_entries(
+        self,
+        start_seq: int = 0,
+        end_seq: Optional[int] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        event_type: Optional[str] = None,
+        severity: Optional[str] = None,
+        search: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT
+                id, sequence_number, previous_hash, entry_data, entry_hash, signature,
+                public_key, signing_mode, event_type, severity, user_id, source,
+                timestamp_utc, entry_id
+            FROM audit_log
+            WHERE sequence_number IS NOT NULL
+              AND sequence_number >= ?
+        """
+        params: list[Any] = [int(start_seq)]
+
+        if end_seq is not None:
+            query += " AND sequence_number <= ?"
+            params.append(int(end_seq))
+        if event_type:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        if severity:
+            query += " AND severity = ?"
+            params.append(severity)
+        if search:
+            query += " AND entry_data LIKE ?"
+            params.append(f"%{search}%")
+
+        query += " ORDER BY sequence_number DESC"
+
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([int(limit), int(offset)])
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
 
     def upsert_setting(self, key: str, value: bytes, encrypted: bool) -> None:
         with self.connection() as conn:
