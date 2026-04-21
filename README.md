@@ -1,4 +1,4 @@
-# CryptoSafe Manager (Sprint 1–4)
+# CryptoSafe Manager (Sprint 1–5)
 
 CryptoSafe Manager — настольный менеджер секретов и паролей с локальным зашифрованным хранилищем, модульной архитектурой и расширяемым графическим интерфейсом.
 
@@ -8,12 +8,14 @@ CryptoSafe Manager — настольный менеджер секретов и
 - **Sprint 2** — аутентификация и управление ключами
 - **Sprint 3** — CRUD хранилища и шифрование записей через AES-256-GCM
 - **Sprint 4** — безопасный буфер обмена с автоочисткой и мониторингом
+- **Sprint 5** — защищённый аудит-лог с проверкой целостности и экспортом
 
 > Важно:
 > - В **Sprint 1** использовалась криптографическая заглушка XOR.
 > - В **Sprint 2** были добавлены Argon2id, PBKDF2, кэширование ключей и смена мастер-пароля.
 > - Начиная с **Sprint 3**, новые записи шифруются индивидуально через **AES-256-GCM**.
 > - В **Sprint 4** добавлен защищённый clipboard-модуль с автоочисткой, уведомлениями и интеграцией с событиями.
+> - В **Sprint 5** добавлен tamper-evident audit log с hash chain и криптографической подписью записей.
 
 ---
 
@@ -60,7 +62,7 @@ CryptoSafe Manager — настольный менеджер секретов и
    - диалог создания/редактирования записи
    - мягкое удаление записей
 
-4. **Sprint 4 (текущий)** — secure clipboard:
+4. **Sprint 4** — secure clipboard:
    - безопасное копирование в буфер обмена
    - автоочистка по таймеру
    - мониторинг внешнего изменения clipboard
@@ -69,10 +71,13 @@ CryptoSafe Manager — настольный менеджер секретов и
    - toast-уведомления
    - сохранение таймаута в settings
 
-5. **Sprint 5**
-   - полноценный аудит-лог
-   - подписи записей журнала
-   - просмотр журнала в GUI
+5. **Sprint 5 (текущий)** — audit trail:
+   - tamper-evident audit logging
+   - hash chain
+   - Ed25519 signing / HMAC fallback
+   - integrity verification
+   - audit log viewer
+   - export JSON / CSV / PDF
 
 6. **Sprint 6**
    - теги
@@ -100,7 +105,7 @@ CryptoSafe Manager — настольный менеджер секретов и
 - `ConfigManager`
 - `StateManager`
 - `EventBus`
-- `AuditLogger`
+- базовый `AuditLogger`
 - базовый GUI shell
 - тесты и CI
 
@@ -153,15 +158,42 @@ CryptoSafe Manager — настольный менеджер секретов и
 - очистка clipboard при закрытии приложения
 - интеграция с `ClipboardCopied` и `ClipboardCleared`
 
-### Что важно в Sprint 4
-Буфер обмена — одно из самых уязвимых мест в менеджерах паролей.  
-В Sprint 4 добавлена безопасная модель работы с clipboard:
+---
 
-- чувствительные данные копируются только при разблокированном хранилище
-- содержимое автоматически очищается
-- новое копирование замещает старое
-- внешнее изменение clipboard вызывает защитную реакцию
-- в памяти приложения данные хранятся в обфусцированном виде
+## Sprint 5
+- добавлен пакет `src/core/audit/`
+- реализован новый `AuditLogger`
+- реализован `AuditLogSigner`
+- реализован `LogVerifier`
+- реализован `AuditExportFormatter`
+- добавлена hash chain структура для audit entries
+- добавлены цифровые подписи записей
+- разделение ключей: signing key выводится отдельно через HKDF с контекстом `audit-signing`
+- добавлен audit log viewer в GUI
+- добавлен экспорт:
+  - signed JSON
+  - CSV
+  - PDF
+- добавлена проверка целостности лога
+- добавлено логирование событий:
+  - authentication
+  - vault operations
+  - clipboard operations
+  - system/security events
+
+### Что важно в Sprint 5
+Sprint 5 добавляет **tamper-evident audit trail**.  
+Каждая запись теперь защищена:
+- последовательным номером
+- хешем предыдущей записи
+- собственным SHA-256 hash
+- криптографической подписью
+
+Это позволяет выявлять:
+- изменение записи в журнале
+- удаление записи
+- разрыв hash chain
+- подмену содержимого журнала
 
 ---
 
@@ -180,9 +212,9 @@ CryptoSafe Manager — настольный менеджер секретов и
 3. AuthenticationManager управляет доступом к encryption key  
 4. EntryManager выполняет CRUD  
 5. ClipboardService управляет clipboard-операциями  
-6. Database сохраняет данные  
-7. EventBus публикует события  
-8. AuditLogger пишет аудит
+6. AuditLogger подписывается на события и записывает audit trail  
+7. Database сохраняет данные  
+8. EventBus публикует события  
 
 ---
 
@@ -206,7 +238,11 @@ cryptosafe-manager/
 │   │   │   ├── clipboard_service.py
 │   │   │   ├── platform_adapter.py
 │   │   │   └── clipboard_monitor.py
-│   │   ├── audit.py
+│   │   ├── audit/
+│   │   │   ├── audit_logger.py
+│   │   │   ├── log_signer.py
+│   │   │   ├── log_verifier.py
+│   │   │   └── log_formatters.py
 │   │   ├── config.py
 │   │   ├── events.py
 │   │   ├── state_manager.py
