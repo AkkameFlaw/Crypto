@@ -11,7 +11,7 @@ class AuditLogViewer(tk.Toplevel):
     def __init__(self, master, db, audit_logger):
         super().__init__(master)
         self.title("Audit Log Viewer")
-        self.geometry("1100x650")
+        self.geometry("1350x700")
         self.db = db
         self.audit_logger = audit_logger
         self.verifier = LogVerifier(audit_logger)
@@ -37,7 +37,12 @@ class AuditLogViewer(tk.Toplevel):
         ttk.Entry(top, textvariable=self.event_var, width=18).pack(side="left", padx=(6, 10))
 
         ttk.Label(top, text="Severity").pack(side="left")
-        ttk.Combobox(top, textvariable=self.severity_var, values=["", "INFO", "WARN", "ERROR", "CRITICAL"], width=12).pack(side="left", padx=(6, 10))
+        ttk.Combobox(
+            top,
+            textvariable=self.severity_var,
+            values=["", "INFO", "WARN", "ERROR", "CRITICAL"],
+            width=12,
+        ).pack(side="left", padx=(6, 10))
 
         ttk.Button(top, text="Apply", command=self._reset_and_refresh).pack(side="left")
         ttk.Button(top, text="Verify", command=self.verify_full).pack(side="left", padx=(10, 0))
@@ -48,8 +53,9 @@ class AuditLogViewer(tk.Toplevel):
         middle = ttk.Frame(self)
         middle.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        columns = ("seq", "timestamp", "severity", "event", "source", "entry_id")
+        columns = ("seq", "timestamp", "severity", "event", "source", "entry_id", "hash")
         self.tree = ttk.Treeview(middle, columns=columns, show="headings", height=18)
+
         for c, title, w in [
             ("seq", "Seq", 70),
             ("timestamp", "Timestamp", 220),
@@ -57,9 +63,11 @@ class AuditLogViewer(tk.Toplevel):
             ("event", "Event", 180),
             ("source", "Source", 120),
             ("entry_id", "Entry ID", 90),
+            ("hash", "Entry Hash", 420),
         ]:
             self.tree.heading(c, text=title)
             self.tree.column(c, width=w, anchor="w")
+
         self.tree.pack(side="left", fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self.show_details)
 
@@ -70,7 +78,7 @@ class AuditLogViewer(tk.Toplevel):
         bottom = ttk.Frame(self)
         bottom.pack(fill="both", expand=False, padx=10, pady=(0, 10))
 
-        self.details = tk.Text(bottom, height=12, wrap="word")
+        self.details = tk.Text(bottom, height=14, wrap="word")
         self.details.pack(fill="both", expand=True)
 
         nav = ttk.Frame(self)
@@ -107,6 +115,7 @@ class AuditLogViewer(tk.Toplevel):
                     row.get("event_type", ""),
                     row.get("source", ""),
                     row.get("entry_id", ""),
+                    (row.get("entry_hash", "")[:16] + "...") if row.get("entry_hash") else "",
                 ),
             )
 
@@ -139,7 +148,16 @@ class AuditLogViewer(tk.Toplevel):
 
     def verify_full(self) -> None:
         report = self.verifier.verify_full()
-        messagebox.showinfo("Verification", self.verifier.to_pretty_text(report))
+
+        win = tk.Toplevel(self)
+        win.title("Audit Verification Report")
+        win.geometry("900x650")
+
+        txt = tk.Text(win, wrap="word")
+        txt.pack(fill="both", expand=True)
+
+        txt.insert("1.0", self.verifier.to_pretty_text(report))
+        txt.configure(state="disabled")
 
     def export_json(self) -> None:
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
