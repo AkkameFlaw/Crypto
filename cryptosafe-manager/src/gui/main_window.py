@@ -13,18 +13,25 @@ from src.core.crypto.key_derivation import Argon2Config, KeyManager, PBKDF2Confi
 from src.core.crypto.key_storage import CachePolicy, SecureKeyCache
 from src.core.events import EventBus
 from src.core.import_export import VaultExporter, VaultImporter, SharingService, KeyExchangeService, QRCodeService
+from src.core.security import (
+    ActivityMonitor,
+    PanicConfig,
+    PanicMode,
+    SecretHolder,
+    build_profile_config,
+)
 from src.core.state_manager import StateManager
 from src.core.vault import AESGCMEntryEncryptionService, EntryManager, PasswordGenerator, PasswordGeneratorOptions
 from src.database.db import Database
 from src.gui.widgets import (
+    AuditLogViewer,
+    ContactsDialog,
+    ExportDialog,
+    ImportDialog,
     PasswordEntry,
     SecureTable,
     SettingsDialog,
-    AuditLogViewer,
-    ExportDialog,
-    ImportDialog,
     ShareDialog,
-    ContactsDialog,
 )
 
 
@@ -303,8 +310,8 @@ class ChangePasswordDialog(tk.Toplevel):
 class MainWindow(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("CryptoSafe Manager (Sprint 6)")
-        self.geometry("1180x720")
+        self.title("CryptoSafe Manager (Sprint 7)")
+        self.geometry("1260x760")
 
         self.bus = EventBus()
         self.state = StateManager()
@@ -347,8 +354,34 @@ class MainWindow(tk.Tk):
         self.key_exchange_service = KeyExchangeService()
         self.qr_service = QRCodeService()
 
+        self.security_profile_name = self._load_security_profile()
+        self.security_profile = build_profile_config(self.security_profile_name)
+
+        self.activity_monitor = ActivityMonitor(
+            lock_callback=self._auto_lock,
+            warning_callback=self._on_auto_lock_warning,
+            profile=self.security_profile,
+        )
+
+        self.panic_mode = PanicMode(
+            config=PanicConfig(
+                close_application=self.security_profile.close_on_panic,
+                show_fake_error=self.security_profile.name == "Paranoid",
+                clear_clipboard=True,
+                wipe_secrets=True,
+                lock_vault=True,
+            ),
+            auth_manager=self.auth,
+            clipboard_service=None,
+            audit_logger=self.audit,
+            main_window=self,
+            secret_wiper=self._wipe_runtime_secrets,
+        )
+
         self._current_rows: list[dict] = []
         self._show_passwords = False
+        self._lock_overlay = None
+        self._was_locked_by_security = False
 
         self._build_menu()
         self._build_toolbar()
@@ -358,6 +391,11 @@ class MainWindow(tk.Tk):
         self.bind_all("<Any-KeyPress>", lambda _e: self._touch_activity())
         self.bind_all("<Any-Button>", lambda _e: self._touch_activity())
         self.bind("<Control-Shift-P>", lambda _e: self.toggle_passwords())
+        self.bind("<FocusIn>", lambda _e: self._on_focus_in())
+        self.bind("<FocusOut>", lambda _e: self._on_focus_out())
+        self.bind("<Unmap>", lambda _e: self._on_window_minimize())
+        self.bind_all("<Motion>", lambda _e: self._touch_activity())
+        self.bind_all("<Control-Shift-Escape>", lambda _e: self.on_panic_mode())
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
 
         self._bootstrap_auth_flow()
@@ -370,6 +408,7 @@ class MainWindow(tk.Tk):
             timeout_seconds=self.clipboard_timeout,
             auth_manager=self.auth,
         )
+        self.panic_mode.clipboard_service = self.clipboard_service
         self.clipboard_service.add_observer(self._on_clipboard_state_changed)
         self.clipboard_monitor = ClipboardMonitor(
             self.clipboard_adapter,
@@ -378,7 +417,9 @@ class MainWindow(tk.Tk):
         )
         self.clipboard_monitor.start()
 
+        self.activity_monitor.start()
         self.refresh_table()
+        self._update_security_status()
         self.after(500, self._poll_clipboard_status)
 
     def _build_menu(self) -> None:
@@ -404,10 +445,13 @@ class MainWindow(tk.Tk):
         share_menu = tk.Menu(menubar, tearoff=0)
         share_menu.add_command(label="Поделиться записью...", command=self.on_share_entry)
         share_menu.add_command(label="Контакты...", command=self.on_contacts)
+        share_menu.add_separator()
+        share_menu.add_command(label="PANIC MODE", command=self.on_panic_mode)
 
         view_menu = tk.Menu(menubar, tearoff=0)
         view_menu.add_command(label="Показать/скрыть пароли", command=self.toggle_passwords)
         view_menu.add_command(label="Настройки", command=self.on_settings)
+        view_menu.add_command(label="Security Profile", command=self.on_security_profile)
         view_menu.add_command(label="Audit Log", command=self.on_audit_log)
 
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -433,6 +477,7 @@ class MainWindow(tk.Tk):
         ttk.Button(bar, text="Копировать пароль", command=self.on_copy_password).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="Копировать логин", command=self.on_copy_username).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Очистить буфер", command=lambda: self.clipboard_service.clear_clipboard("manual")).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="PANIC", command=self.on_panic_mode).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="Показать/скрыть пароли (Ctrl+Shift+P)", command=self.toggle_passwords).pack(side="left", padx=(12, 0))
 
         ttk.Label(bar, text="Поиск:").pack(side="left", padx=(20, 6))
@@ -474,6 +519,18 @@ class MainWindow(tk.Tk):
 
     def _save_clipboard_timeout(self, value: int) -> None:
         self.db.upsert_setting("clipboard_timeout_seconds", str(value).encode("utf-8"), encrypted=False)
+
+    def _load_security_profile(self) -> str:
+        row = self.db.get_setting("security_profile")
+        if not row:
+            return "standard"
+        try:
+            return row[0].decode("utf-8").strip().lower() or "standard"
+        except Exception:
+            return "standard"
+
+    def _save_security_profile(self, value: str) -> None:
+        self.db.upsert_setting("security_profile", value.encode("utf-8"), encrypted=False)
 
     def _bootstrap_auth_flow(self) -> None:
         if not self.auth.is_initialized():
@@ -531,10 +588,122 @@ class MainWindow(tk.Tk):
     def _set_status(self, msg: str) -> None:
         self.status_var.set(f"Статус: {msg}")
 
+    def _update_security_status(self) -> None:
+        if hasattr(self, "session_var"):
+            self.session_var.set(f"Сессия: active | profile={self.security_profile.name}")
+
+    def _wipe_runtime_secrets(self) -> None:
+        try:
+            SecretHolder.wipe_all()
+        except Exception:
+            pass
+
     def _touch_activity(self) -> None:
         self.state.touch_activity()
         self.auth.touch_activity()
-        self.session_var.set("Сессия: active")
+        self.activity_monitor.record_activity()
+        self.session_var.set(f"Сессия: active | profile={self.security_profile.name}")
+
+    def _on_focus_in(self) -> None:
+        self.activity_monitor.set_focus(True)
+        self._touch_activity()
+
+    def _on_focus_out(self) -> None:
+        self.activity_monitor.set_focus(False)
+        if self.security_profile.lock_on_focus_loss and self.auth.get_encryption_key():
+            self.after(200, self.activity_monitor.force_lock_check)
+
+    def _on_window_minimize(self) -> None:
+        try:
+            if self.state() == "iconic" and self.security_profile.name == "Paranoid":
+                self._auto_lock()
+        except Exception:
+            pass
+
+    def _on_auto_lock_warning(self, remaining: int) -> None:
+        self._show_toast(f"Автоблокировка через {remaining} сек.")
+
+    def _auto_lock(self) -> None:
+        if not self.auth.get_encryption_key():
+            return
+
+        try:
+            if self.security_profile.clear_clipboard_on_lock:
+                self.clipboard_service.clear_clipboard("auto_lock")
+        except Exception:
+            pass
+
+        try:
+            self.audit.log_event(
+                event_type="AUTO_LOCK_TRIGGERED",
+                severity="WARN",
+                source="security",
+                details={"profile": self.security_profile.name},
+            )
+        except Exception:
+            pass
+
+        self._was_locked_by_security = True
+        self.auth.logout()
+        self._wipe_runtime_secrets()
+        self._set_status("locked")
+        self._show_lock_overlay()
+
+    def _show_lock_overlay(self) -> None:
+        if self._lock_overlay and self._lock_overlay.winfo_exists():
+            return
+
+        overlay = tk.Toplevel(self)
+        overlay.title("Vault Locked")
+        overlay.geometry("420x220")
+        overlay.transient(self)
+        overlay.grab_set()
+        overlay.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        frm = ttk.Frame(overlay)
+        frm.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ttk.Label(frm, text="Хранилище заблокировано", font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
+        ttk.Label(frm, text="Введите мастер-пароль для продолжения.").pack(anchor="w", pady=(8, 0))
+
+        password = PasswordEntry(frm)
+        password.pack(fill="x", pady=(12, 0))
+
+        msg_var = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=msg_var).pack(anchor="w", pady=(8, 0))
+
+        def unlock():
+            ok, msg = self.auth.authenticate(password.get())
+            if not ok:
+                msg_var.set(msg or "Ошибка входа")
+                return
+
+            self._was_locked_by_security = False
+            self.activity_monitor.record_activity()
+            self._set_status("unlocked")
+            self._update_security_status()
+            overlay.destroy()
+            self._lock_overlay = None
+
+            try:
+                self.audit.log_event(
+                    event_type="VAULT_RELOCKED",
+                    severity="INFO",
+                    source="security",
+                    details={"profile": self.security_profile.name},
+                )
+            except Exception:
+                pass
+
+            self.deiconify()
+            self.refresh_table()
+
+        btns = ttk.Frame(frm)
+        btns.pack(anchor="e", pady=(12, 0))
+        ttk.Button(btns, text="Разблокировать", command=unlock).pack(side="right")
+
+        self._lock_overlay = overlay
+        password.focus()
 
     def refresh_table(self) -> None:
         query = self.search_var.get().strip() if hasattr(self, "search_var") else ""
@@ -617,6 +786,7 @@ class MainWindow(tk.Tk):
         menu.add_command(label="Копировать всё", command=self.on_copy_all)
         menu.add_separator()
         menu.add_command(label="Поделиться", command=self.on_share_entry)
+        menu.add_command(label="PANIC MODE", command=self.on_panic_mode)
         menu.add_command(label="Показать/скрыть пароли", command=self.toggle_passwords)
         menu.tk_popup(event.x_root, event.y_root)
 
@@ -731,6 +901,47 @@ class MainWindow(tk.Tk):
         self._save_clipboard_timeout(value)
         self._show_toast("Настройка буфера обмена сохранена")
 
+    def on_security_profile(self) -> None:
+        choice = simpledialog.askstring(
+            "Security Profile",
+            "Введите профиль: standard / enhanced / paranoid",
+            initialvalue=self.security_profile_name,
+            parent=self,
+        )
+        if not choice:
+            return
+
+        normalized = choice.strip().lower()
+        if normalized not in {"standard", "enhanced", "paranoid"}:
+            messagebox.showerror("Ошибка", "Допустимо: standard, enhanced, paranoid")
+            return
+
+        old_name = self.security_profile_name
+        self.security_profile_name = normalized
+        self.security_profile = build_profile_config(normalized)
+        self.activity_monitor.set_profile(self.security_profile)
+        self.panic_mode.config.close_application = self.security_profile.close_on_panic
+        self.panic_mode.config.show_fake_error = self.security_profile.name == "Paranoid"
+        self._save_security_profile(normalized)
+        self._update_security_status()
+
+        try:
+            self.audit.log_event(
+                event_type="SECURITY_PROFILE_CHANGED",
+                severity="INFO",
+                source="security",
+                details={"old_profile": old_name, "new_profile": normalized},
+            )
+        except Exception:
+            pass
+
+        messagebox.showinfo(
+            "Профиль применён",
+            f"Текущий профиль: {self.security_profile.name}\n"
+            f"Auto-lock: {self.security_profile.auto_lock_seconds} sec\n"
+            f"Lock on focus loss: {self.security_profile.lock_on_focus_loss}",
+        )
+
     def on_audit_log(self) -> None:
         if not self.auth.get_encryption_key():
             messagebox.showerror("Ошибка", "Хранилище заблокировано")
@@ -740,8 +951,23 @@ class MainWindow(tk.Tk):
     def on_about(self) -> None:
         messagebox.showinfo(
             "О программе",
-            "CryptoSafe Manager — Sprint 6\nVault, audit logging, secure clipboard, import/export, sharing and QR exchange.",
+            "CryptoSafe Manager — Sprint 7\nVault, audit logging, secure clipboard, import/export, sharing, QR and security hardening.",
         )
+
+    def on_panic_mode(self) -> None:
+        self.panic_mode.activate(method="hotkey")
+
+    def handle_panic_ui(self, close_app: bool = False) -> None:
+        try:
+            self.withdraw()
+        except Exception:
+            pass
+
+        if close_app:
+            self.after(200, self.on_exit)
+            return
+
+        self.after(300, self._show_lock_overlay)
 
     def _show_toast(self, text: str) -> None:
         toast = tk.Toplevel(self)
@@ -782,6 +1008,10 @@ class MainWindow(tk.Tk):
 
     def on_exit(self) -> None:
         try:
+            self.activity_monitor.stop()
+        except Exception:
+            pass
+        try:
             self.clipboard_monitor.stop()
         except Exception:
             pass
@@ -791,6 +1021,10 @@ class MainWindow(tk.Tk):
             pass
         self.auth.logout()
         self.state.mark_logout()
+        try:
+            self.db.close()
+        except Exception:
+            pass
         self.destroy()
 
 
