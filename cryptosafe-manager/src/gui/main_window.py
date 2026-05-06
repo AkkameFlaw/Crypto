@@ -12,10 +12,20 @@ from src.core.crypto.authentication import AuthenticationManager
 from src.core.crypto.key_derivation import Argon2Config, KeyManager, PBKDF2Config, PasswordPolicy
 from src.core.crypto.key_storage import CachePolicy, SecureKeyCache
 from src.core.events import EventBus
+from src.core.import_export import VaultExporter, VaultImporter, SharingService, KeyExchangeService, QRCodeService
 from src.core.state_manager import StateManager
 from src.core.vault import AESGCMEntryEncryptionService, EntryManager, PasswordGenerator, PasswordGeneratorOptions
 from src.database.db import Database
-from src.gui.widgets import PasswordEntry, SecureTable, SettingsDialog, AuditLogViewer
+from src.gui.widgets import (
+    PasswordEntry,
+    SecureTable,
+    SettingsDialog,
+    AuditLogViewer,
+    ExportDialog,
+    ImportDialog,
+    ShareDialog,
+    ContactsDialog,
+)
 
 
 class SetupWizard(tk.Toplevel):
@@ -293,8 +303,8 @@ class ChangePasswordDialog(tk.Toplevel):
 class MainWindow(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("CryptoSafe Manager (Sprint 5)")
-        self.geometry("1120x690")
+        self.title("CryptoSafe Manager (Sprint 6)")
+        self.geometry("1180x720")
 
         self.bus = EventBus()
         self.state = StateManager()
@@ -330,6 +340,12 @@ class MainWindow(tk.Tk):
 
         self.audit = AuditLogger(self.bus, self.db, self.auth)
         self.audit.start()
+
+        self.exporter = VaultExporter(self.entry_manager, self.auth, self.audit)
+        self.importer = VaultImporter(self.entry_manager, self.audit)
+        self.sharing_service = SharingService(self.db, self.entry_manager, self.audit)
+        self.key_exchange_service = KeyExchangeService()
+        self.qr_service = QRCodeService()
 
         self._current_rows: list[dict] = []
         self._show_passwords = False
@@ -370,6 +386,8 @@ class MainWindow(tk.Tk):
 
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Создать запись", command=self.on_add_entry)
+        file_menu.add_command(label="Импорт...", command=self.on_import_vault)
+        file_menu.add_command(label="Экспорт...", command=self.on_export_vault)
         file_menu.add_command(label="Сменить пароль", command=self.on_change_password)
         file_menu.add_separator()
         file_menu.add_command(label="Выход", command=self.on_exit)
@@ -383,6 +401,10 @@ class MainWindow(tk.Tk):
         edit_menu.add_command(label="Копировать логин", command=self.on_copy_username)
         edit_menu.add_command(label="Очистить буфер", command=lambda: self.clipboard_service.clear_clipboard("manual"))
 
+        share_menu = tk.Menu(menubar, tearoff=0)
+        share_menu.add_command(label="Поделиться записью...", command=self.on_share_entry)
+        share_menu.add_command(label="Контакты...", command=self.on_contacts)
+
         view_menu = tk.Menu(menubar, tearoff=0)
         view_menu.add_command(label="Показать/скрыть пароли", command=self.toggle_passwords)
         view_menu.add_command(label="Настройки", command=self.on_settings)
@@ -393,6 +415,7 @@ class MainWindow(tk.Tk):
 
         menubar.add_cascade(label="Файл", menu=file_menu)
         menubar.add_cascade(label="Правка", menu=edit_menu)
+        menubar.add_cascade(label="Обмен", menu=share_menu)
         menubar.add_cascade(label="Вид", menu=view_menu)
         menubar.add_cascade(label="Справка", menu=help_menu)
         self.config(menu=menubar)
@@ -404,6 +427,9 @@ class MainWindow(tk.Tk):
         ttk.Button(bar, text="Добавить", command=self.on_add_entry).pack(side="left")
         ttk.Button(bar, text="Изменить", command=self.on_edit_entry).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Удалить", command=self.on_delete_entry).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="Импорт", command=self.on_import_vault).pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="Экспорт", command=self.on_export_vault).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="Поделиться", command=self.on_share_entry).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Копировать пароль", command=self.on_copy_password).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="Копировать логин", command=self.on_copy_username).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Очистить буфер", command=lambda: self.clipboard_service.clear_clipboard("manual")).pack(side="left", padx=(6, 0))
@@ -460,13 +486,18 @@ class MainWindow(tk.Tk):
             if db_path != self.cfg.db_path:
                 self.cfg.db_path = db_path
                 self.cfg_mgr.save(self.cfg)
-                self.db = Database(self.cfg.db_path, pool_size=4)
+                self.db = Database(self.cfg.db_path, pool_size=8)
                 self.db.initialize()
                 self.auth = AuthenticationManager(self.db, self.key_manager, self.key_cache, self.bus)
                 self.entry_encryption = AESGCMEntryEncryptionService(self.auth)
                 self.entry_manager = EntryManager(self.db, self.entry_encryption, self.bus)
                 self.audit = AuditLogger(self.bus, self.db, self.auth)
                 self.audit.start()
+                self.exporter = VaultExporter(self.entry_manager, self.auth, self.audit)
+                self.importer = VaultImporter(self.entry_manager, self.audit)
+                self.sharing_service = SharingService(self.db, self.entry_manager, self.audit)
+                self.key_exchange_service = KeyExchangeService()
+                self.qr_service = QRCodeService()
 
             try:
                 self.auth.initialize_master_password(password)
@@ -585,6 +616,7 @@ class MainWindow(tk.Tk):
         menu.add_command(label="Копировать логин", command=self.on_copy_username)
         menu.add_command(label="Копировать всё", command=self.on_copy_all)
         menu.add_separator()
+        menu.add_command(label="Поделиться", command=self.on_share_entry)
         menu.add_command(label="Показать/скрыть пароли", command=self.toggle_passwords)
         menu.tk_popup(event.x_root, event.y_root)
 
@@ -645,6 +677,42 @@ class MainWindow(tk.Tk):
     def on_change_password(self) -> None:
         ChangePasswordDialog(self, self.auth)
 
+    def on_export_vault(self) -> None:
+        if not self.auth.get_encryption_key():
+            messagebox.showerror("Ошибка", "Хранилище заблокировано")
+            return
+        ExportDialog(self, self.db, self.auth, self.entry_manager, self.exporter)
+
+    def on_import_vault(self) -> None:
+        if not self.auth.get_encryption_key():
+            messagebox.showerror("Ошибка", "Хранилище заблокировано")
+            return
+        dialog = ImportDialog(self, self.db, self.auth, self.importer)
+        self.wait_window(dialog)
+        self.refresh_table()
+
+    def on_share_entry(self) -> None:
+        if not self.auth.get_encryption_key():
+            messagebox.showerror("Ошибка", "Хранилище заблокировано")
+            return
+
+        entry_id = self._selected_single_id()
+        if entry_id is None:
+            return
+
+        ShareDialog(
+            self,
+            self.db,
+            self.entry_manager,
+            self.sharing_service,
+            self.key_exchange_service,
+            self.qr_service,
+            entry_id,
+        )
+
+    def on_contacts(self) -> None:
+        ContactsDialog(self, self.db, self.key_exchange_service)
+
     def on_settings(self) -> None:
         value = simpledialog.askinteger(
             "Настройки буфера обмена",
@@ -672,7 +740,7 @@ class MainWindow(tk.Tk):
     def on_about(self) -> None:
         messagebox.showinfo(
             "О программе",
-            "CryptoSafe Manager — Sprint 5\nAudit logging, secure clipboard, AES-GCM vault and key management.",
+            "CryptoSafe Manager — Sprint 6\nVault, audit logging, secure clipboard, import/export, sharing and QR exchange.",
         )
 
     def _show_toast(self, text: str) -> None:

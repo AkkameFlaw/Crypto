@@ -12,7 +12,7 @@ from src.core.crypto.placeholder import AES256Placeholder
 from src.core.utils import minimal_path_permissions
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class DatabaseError(Exception):
@@ -99,6 +99,11 @@ class Database:
             self._migration_3_to_4(conn)
             conn.execute("PRAGMA user_version=4;")
             current = 4
+
+        if current == 4:
+            self._migration_4_to_5(conn)
+            conn.execute("PRAGMA user_version=5;")
+            current = 5
 
         if current != SCHEMA_VERSION:
             raise DatabaseError("Unsupported database schema version")
@@ -274,6 +279,63 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_sequence_number ON audit_log(sequence_number);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_event_type ON audit_log(event_type);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp_utc ON audit_log(timestamp_utc);")
+
+            conn.execute("COMMIT;")
+        except Exception:
+            conn.execute("ROLLBACK;")
+            raise
+
+    def _migration_4_to_5(self, conn: sqlite3.Connection) -> None:
+        conn.execute("BEGIN;")
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS shared_entries (
+                    shared_id TEXT PRIMARY KEY,
+                    original_entry_id INTEGER NOT NULL,
+                    encryption_method TEXT NOT NULL,
+                    recipient_info TEXT NOT NULL,
+                    permissions TEXT NOT NULL,
+                    shared_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_shared_entries_original_entry_id ON shared_entries(original_entry_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_shared_entries_expires_at ON shared_entries(expires_at);")
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_export_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation_type TEXT NOT NULL,
+                    data_format TEXT NOT NULL,
+                    encryption_used TEXT NOT NULL,
+                    entry_count INTEGER NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    checksum TEXT NOT NULL,
+                    verification_status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_import_export_history_created_at ON import_export_history(created_at);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_import_export_history_operation_type ON import_export_history(operation_type);")
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS contacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contact_name TEXT NOT NULL,
+                    contact_identifier TEXT NOT NULL,
+                    public_key TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    last_used_at TEXT
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_identifier ON contacts(contact_identifier);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_fingerprint ON contacts(fingerprint);")
 
             conn.execute("COMMIT;")
         except Exception:
@@ -679,3 +741,96 @@ class Database:
 
     def restore(self, *_args, **_kwargs) -> None:
         raise NotImplementedError("Restore will be implemented in Sprint 8")
+
+    def insert_shared_entry(
+        self,
+        share_id: str,
+        original_entry_id: int,
+        encryption_method: str,
+        recipient_info: str,
+        permissions: str,
+        shared_at: str,
+        expires_at: str,
+    ) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO shared_entries
+                (shared_id, original_entry_id, encryption_method, recipient_info, permissions, shared_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    share_id,
+                    int(original_entry_id),
+                    encryption_method,
+                    recipient_info,
+                    permissions,
+                    shared_at,
+                    expires_at,
+                ),
+            )
+
+    def insert_import_export_history(
+        self,
+        operation_type: str,
+        data_format: str,
+        encryption_used: str,
+        entry_count: int,
+        file_size: int,
+        checksum: str,
+        verification_status: str,
+        created_at: str,
+    ) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO import_export_history
+                (operation_type, data_format, encryption_used, entry_count, file_size, checksum, verification_status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    operation_type,
+                    data_format,
+                    encryption_used,
+                    int(entry_count),
+                    int(file_size),
+                    checksum,
+                    verification_status,
+                    created_at,
+                ),
+            )
+
+    def add_contact(
+        self,
+        contact_name: str,
+        contact_identifier: str,
+        public_key: str,
+        fingerprint: str,
+        last_used_at: str | None = None,
+    ) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO contacts
+                (contact_name, contact_identifier, public_key, fingerprint, last_used_at)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                (
+                    contact_name,
+                    contact_identifier,
+                    public_key,
+                    fingerprint,
+                    last_used_at,
+                ),
+            )
+
+    def list_contacts(self) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, contact_name, contact_identifier, public_key, fingerprint, last_used_at
+                FROM contacts
+                ORDER BY contact_name ASC;
+                """
+            ).fetchall()
+            return [dict(r) for r in rows]
