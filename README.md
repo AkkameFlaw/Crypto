@@ -2,28 +2,29 @@
 
 CryptoSafe Manager — настольный менеджер секретов и паролей с локальным зашифрованным хранилищем, модульной архитектурой и расширяемым GUI.
 
-> В проекте используется поэтапная реализация по спринтам. На текущем этапе добавлены:
-> - Sprint 1 — архитектурный фундамент
-> - Sprint 2 — мастер-пароль, KDF и аутентификация
-> - Sprint 3 — AES-GCM и CRUD для хранилища
-> - Sprint 4 — безопасный буфер обмена
-> - Sprint 5 — tamper-evident audit log
-> - Sprint 6 — import/export, sharing, key exchange, QR workflow
+На текущем этапе проект включает:
+
+- Sprint 1 — архитектурный фундамент
+- Sprint 2 — мастер-пароль, KDF и аутентификация
+- Sprint 3 — AES-GCM и CRUD для vault
+- Sprint 4 — безопасный буфер обмена
+- Sprint 5 — tamper-evident audit log
+- Sprint 6 — import/export, sharing, key exchange и QR workflow
+- Sprint 7 — security hardening, auto-lock, panic mode и security profiles
 
 ---
 
-## Что делает проект
+## Назначение проекта
 
-CryptoSafe Manager предназначен для безопасного хранения и управления секретами:
+CryptoSafe Manager предназначен для безопасного хранения и управления конфиденциальными данными:
 
-- хранение логинов, паролей, URL, заметок, тегов и категорий
-- шифрование записей на уровне vault
-- мастер-пароль и управление ключами
-- журнал аудита с контролем целостности
-- безопасный буфер обмена с автоочисткой
+- логины и пароли
+- URL и заметки
+- категории и теги
+- безопасный обмен отдельными записями
+- аудит событий безопасности
 - импорт и экспорт данных
-- обмен отдельными записями
-- QR-based workflow для передачи share package / ключей
+- emergency response механизмы
 
 ---
 
@@ -31,86 +32,88 @@ CryptoSafe Manager предназначен для безопасного хра
 
 ### Sprint 1
 Базовая архитектура проекта:
-- MVC / layered structure
+- layered / MVC-like structure
 - SQLite schema
-- crypto placeholders
 - EventBus
 - GUI shell
+- placeholder crypto
 - базовые тесты
 
 ### Sprint 2
-Аутентификация и управление ключами:
+Аутентификация и ключи:
 - мастер-пароль
 - Argon2 / PBKDF2
 - key cache
-- login flow
+- login / logout flow
 - password rotation
 
 ### Sprint 3
-Полноценное vault-хранилище:
+Vault и CRUD:
 - AES-256-GCM для записей
-- CRUD
+- create / read / update / delete
 - password generator
-- search/filter
-- табличный интерфейс
+- search / filter
+- vault table UI
 
 ### Sprint 4
-Безопасный буфер обмена:
-- copy password / username
-- auto-clear timer
+Безопасный clipboard:
+- copy username/password
+- auto-clear
 - clipboard monitor
-- secure clipboard state
+- clipboard status
 
 ### Sprint 5
-Журнал аудита:
+Audit logging:
 - tamper-evident audit log
-- подпись / hash chain
-- viewer
-- экспорт аудита
+- signatures / hash chain
 - integrity verification
+- audit viewer
+- export of audit data
 
 ### Sprint 6
-Импорт, экспорт и обмен:
+Import / Export / Sharing:
 - encrypted export/import
 - CSV / Bitwarden / LastPass compatibility
-- selective export
-- sharing отдельных записей
-- public/private key exchange
+- sharing entry packages
+- key exchange
 - QR generation workflow
-- contacts + history tables
+- contacts and history tables
 
 ### Sprint 7
-Планируется:
-- auto-lock policies
+Security hardening:
+- side-channel protection helpers
+- secure memory handling
+- activity monitor and auto-lock
 - panic mode
-- session hardening
+- security profiles
+- GUI integration for re-lock / security state
 
 ### Sprint 8
 Планируется:
 - backup / restore
 - packaging / distribution
-- installer / Docker / release artifacts
+- release artifacts / installer
 
 ---
 
 ## Архитектура
 
-Проект разделён по слоям:
+Проект организован по слоям:
 
-- `src/core/` — бизнес-логика, криптография, import/export, audit, clipboard
-- `src/database/` — база данных, миграции, доступ к SQLite
-- `src/gui/` — пользовательский интерфейс и виджеты
-- `tests/` — unit, integration и demo scenarios
+- `src/core/` — бизнес-логика, криптография, clipboard, audit, import/export, security
+- `src/database/` — SQLite, schema, migrations, data access
+- `src/gui/` — GUI и виджеты
+- `tests/` — unit tests, integration tests и demo scenarios
 
-### Упрощённый поток MVC
+### Упрощённый поток работы
 
-1. GUI инициирует действие пользователя  
-2. Core проверяет сессию и ключи  
-3. Core шифрует / обрабатывает данные  
+1. GUI получает действие пользователя  
+2. Core проверяет аутентификацию и состояние vault  
+3. Core выполняет шифрование / дешифрование / обработку  
 4. Database сохраняет изменения  
 5. EventBus публикует событие  
-6. Audit logger пишет событие в журнал  
-7. GUI обновляет состояние
+6. Audit logger пишет его в журнал  
+7. GUI обновляет интерфейс
 
 ---
 
@@ -129,6 +132,11 @@ cryptosafe-manager/
 │   │   │   ├── importer.py
 │   │   │   ├── sharing_service.py
 │   │   │   └── key_exchange.py
+│   │   ├── security/
+│   │   │   ├── side_channel_protection.py
+│   │   │   ├── memory_guard.py
+│   │   │   ├── activity_monitor.py
+│   │   │   └── panic_mode.py
 │   │   ├── vault/
 │   │   ├── events.py
 │   │   ├── config.py
