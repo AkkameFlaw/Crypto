@@ -20,6 +20,7 @@ from src.core.security import (
     SecretHolder,
     build_profile_config,
 )
+from src.core.security.tray_manager import TrayManager
 from src.core.state_manager import StateManager
 from src.core.vault import AESGCMEntryEncryptionService, EntryManager, PasswordGenerator, PasswordGeneratorOptions
 from src.database.db import Database
@@ -317,6 +318,7 @@ class MainWindow(tk.Tk):
         self.state = StateManager()
         self.cfg_mgr = ConfigManager(env=os.getenv("CRYPTOSAFE_ENV", "development"))
         self.cfg = self.cfg_mgr.load()
+        print("CURRENT DB PATH:", self.cfg.db_path)
 
         self.db = Database(self.cfg.db_path, pool_size=8)
         self.db.initialize()
@@ -382,6 +384,9 @@ class MainWindow(tk.Tk):
         self._show_passwords = False
         self._lock_overlay = None
         self._was_locked_by_security = False
+        self._suspend_focus_lock = False
+        self.start_minimized_to_tray = False
+        self._window_was_withdrawn_to_tray = False
 
         self._build_menu()
         self._build_toolbar()
@@ -395,7 +400,7 @@ class MainWindow(tk.Tk):
         self.bind("<FocusOut>", lambda _e: self._on_focus_out())
         self.bind("<Unmap>", lambda _e: self._on_window_minimize())
         self.bind_all("<Motion>", lambda _e: self._touch_activity())
-        self.bind_all("<Control-Shift-Escape>", lambda _e: self.on_panic_mode())
+        self.bind_all("<Control-Shift-Escape>", lambda _e: self.on_panic_mode_hotkey())
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
 
         self._bootstrap_auth_flow()
@@ -417,10 +422,33 @@ class MainWindow(tk.Tk):
         )
         self.clipboard_monitor.start()
 
+        self.tray = TrayManager(
+            on_show_window=self._restore_from_tray,
+            on_lock=self._tray_lock_vault,
+            on_unlock=self._tray_unlock_vault,
+            on_quick_search=self._tray_quick_search,
+            on_clear_clipboard=self._tray_clear_clipboard,
+            on_panic=self.on_panic_mode_tray,
+            on_settings=self.on_settings,
+            on_exit=self.on_exit,
+            notify_callback=lambda title, msg: self._show_toast(f"{title}: {msg}"),
+        )
+        self.tray.start()
+        self.tray.update_state(
+            locked=not bool(self.auth.get_encryption_key()),
+            clipboard_active=False,
+            clipboard_remaining=0,
+            security_profile=self.security_profile.name,
+            crypto_busy=False,
+        )
+
         self.activity_monitor.start()
         self.refresh_table()
         self._update_security_status()
         self.after(500, self._poll_clipboard_status)
+
+        if self.start_minimized_to_tray:
+            self.after(200, self._minimize_to_tray)
 
     def _build_menu(self) -> None:
         menubar = tk.Menu(self)
@@ -446,7 +474,7 @@ class MainWindow(tk.Tk):
         share_menu.add_command(label="Поделиться записью...", command=self.on_share_entry)
         share_menu.add_command(label="Контакты...", command=self.on_contacts)
         share_menu.add_separator()
-        share_menu.add_command(label="PANIC MODE", command=self.on_panic_mode)
+        share_menu.add_command(label="PANIC MODE", command=self.on_panic_mode_button)
 
         view_menu = tk.Menu(menubar, tearoff=0)
         view_menu.add_command(label="Показать/скрыть пароли", command=self.toggle_passwords)
@@ -477,7 +505,7 @@ class MainWindow(tk.Tk):
         ttk.Button(bar, text="Копировать пароль", command=self.on_copy_password).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="Копировать логин", command=self.on_copy_username).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Очистить буфер", command=lambda: self.clipboard_service.clear_clipboard("manual")).pack(side="left", padx=(6, 0))
-        ttk.Button(bar, text="PANIC", command=self.on_panic_mode).pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="PANIC", command=self.on_panic_mode_button).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="Показать/скрыть пароли (Ctrl+Shift+P)", command=self.toggle_passwords).pack(side="left", padx=(12, 0))
 
         ttk.Label(bar, text="Поиск:").pack(side="left", padx=(20, 6))
@@ -604,24 +632,34 @@ class MainWindow(tk.Tk):
         self.activity_monitor.record_activity()
         self.session_var.set(f"Сессия: active | profile={self.security_profile.name}")
 
+    def _run_without_focus_lock(self, func):
+        self._suspend_focus_lock = True
+        try:
+            return func()
+        finally:
+            self.after(300, lambda: setattr(self, "_suspend_focus_lock", False))
+
     def _on_focus_in(self) -> None:
         self.activity_monitor.set_focus(True)
         self._touch_activity()
 
     def _on_focus_out(self) -> None:
+        if self._suspend_focus_lock:
+            return
         self.activity_monitor.set_focus(False)
         if self.security_profile.lock_on_focus_loss and self.auth.get_encryption_key():
             self.after(200, self.activity_monitor.force_lock_check)
 
     def _on_window_minimize(self) -> None:
         try:
-            if self.state() == "iconic" and self.security_profile.name == "Paranoid":
-                self._auto_lock()
+            if self.state() == "iconic":
+                self.after(50, self._minimize_to_tray)
         except Exception:
             pass
 
     def _on_auto_lock_warning(self, remaining: int) -> None:
         self._show_toast(f"Автоблокировка через {remaining} сек.")
+        self.tray.show_notification("CryptoSafe Manager", f"Автоблокировка через {remaining} сек.")
 
     def _auto_lock(self) -> None:
         if not self.auth.get_encryption_key():
@@ -647,6 +685,11 @@ class MainWindow(tk.Tk):
         self.auth.logout()
         self._wipe_runtime_secrets()
         self._set_status("locked")
+        self.tray.update_state(
+            locked=True,
+            security_profile=self.security_profile.name,
+            crypto_busy=False,
+        )
         self._show_lock_overlay()
 
     def _show_lock_overlay(self) -> None:
@@ -695,6 +738,16 @@ class MainWindow(tk.Tk):
             except Exception:
                 pass
 
+            try:
+                self.panic_mode.reset()
+            except Exception:
+                pass
+
+            self.tray.update_state(
+                locked=False,
+                security_profile=self.security_profile.name,
+                crypto_busy=False,
+            )
             self.deiconify()
             self.refresh_table()
 
@@ -786,25 +839,39 @@ class MainWindow(tk.Tk):
         menu.add_command(label="Копировать всё", command=self.on_copy_all)
         menu.add_separator()
         menu.add_command(label="Поделиться", command=self.on_share_entry)
-        menu.add_command(label="PANIC MODE", command=self.on_panic_mode)
+        menu.add_command(label="PANIC MODE", command=self.on_panic_mode_button)
         menu.add_command(label="Показать/скрыть пароли", command=self.toggle_passwords)
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _set_crypto_busy(self, busy: bool) -> None:
+        self.tray.update_state(
+            crypto_busy=busy,
+            locked=not bool(self.auth.get_encryption_key()),
+            security_profile=self.security_profile.name,
+        )
 
     def on_add_entry(self) -> None:
         if not self.auth.get_encryption_key():
             messagebox.showerror("Ошибка", "Хранилище заблокировано")
             return
 
-        dialog = EntryDialog(self, "Новая запись", generator=self.password_generator)
-        self.wait_window(dialog)
-        if dialog.result is None:
+        def _open():
+            dialog = EntryDialog(self, "Новая запись", generator=self.password_generator)
+            self.wait_window(dialog)
+            return dialog.result
+
+        result = self._run_without_focus_lock(_open)
+        if result is None:
             return
 
         try:
-            self.entry_manager.create_entry(dialog.result)
+            self._set_crypto_busy(True)
+            self.entry_manager.create_entry(result)
             self.refresh_table()
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
+        finally:
+            self._set_crypto_busy(False)
 
     def on_edit_entry(self) -> None:
         entry_id = self._selected_single_id()
@@ -817,16 +884,23 @@ class MainWindow(tk.Tk):
             messagebox.showerror("Ошибка", "Не удалось открыть запись")
             return
 
-        dialog = EntryDialog(self, "Редактировать запись", initial=current, generator=self.password_generator)
-        self.wait_window(dialog)
-        if dialog.result is None:
+        def _open():
+            dialog = EntryDialog(self, "Редактировать запись", initial=current, generator=self.password_generator)
+            self.wait_window(dialog)
+            return dialog.result
+
+        result = self._run_without_focus_lock(_open)
+        if result is None:
             return
 
         try:
-            self.entry_manager.update_entry(entry_id, dialog.result)
+            self._set_crypto_busy(True)
+            self.entry_manager.update_entry(entry_id, result)
             self.refresh_table()
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
+        finally:
+            self._set_crypto_busy(False)
 
     def on_delete_entry(self) -> None:
         ids = self.table.selected_ids()
@@ -836,30 +910,44 @@ class MainWindow(tk.Tk):
         if not messagebox.askyesno("Подтверждение", f"Удалить выбранные записи: {len(ids)}?"):
             return
 
-        for entry_id in ids:
-            try:
+        try:
+            self._set_crypto_busy(True)
+            for entry_id in ids:
                 self.entry_manager.delete_entry(entry_id, soft_delete=True)
-            except Exception:
-                messagebox.showerror("Ошибка", "Не удалось удалить запись")
-                return
-        self.refresh_table()
+            self.refresh_table()
+        except Exception:
+            messagebox.showerror("Ошибка", "Не удалось удалить запись")
+        finally:
+            self._set_crypto_busy(False)
 
     def on_change_password(self) -> None:
-        ChangePasswordDialog(self, self.auth)
+        self._run_without_focus_lock(lambda: ChangePasswordDialog(self, self.auth))
 
     def on_export_vault(self) -> None:
         if not self.auth.get_encryption_key():
             messagebox.showerror("Ошибка", "Хранилище заблокировано")
             return
-        ExportDialog(self, self.db, self.auth, self.entry_manager, self.exporter)
+        try:
+            self._set_crypto_busy(True)
+            self._run_without_focus_lock(lambda: ExportDialog(self, self.db, self.auth, self.entry_manager, self.exporter))
+        finally:
+            self._set_crypto_busy(False)
 
     def on_import_vault(self) -> None:
         if not self.auth.get_encryption_key():
             messagebox.showerror("Ошибка", "Хранилище заблокировано")
             return
-        dialog = ImportDialog(self, self.db, self.auth, self.importer)
-        self.wait_window(dialog)
-        self.refresh_table()
+
+        def _open():
+            dialog = ImportDialog(self, self.db, self.auth, self.importer)
+            self.wait_window(dialog)
+
+        try:
+            self._set_crypto_busy(True)
+            self._run_without_focus_lock(_open)
+            self.refresh_table()
+        finally:
+            self._set_crypto_busy(False)
 
     def on_share_entry(self) -> None:
         if not self.auth.get_encryption_key():
@@ -870,28 +958,37 @@ class MainWindow(tk.Tk):
         if entry_id is None:
             return
 
-        ShareDialog(
-            self,
-            self.db,
-            self.entry_manager,
-            self.sharing_service,
-            self.key_exchange_service,
-            self.qr_service,
-            entry_id,
-        )
+        try:
+            self._set_crypto_busy(True)
+            self._run_without_focus_lock(
+                lambda: ShareDialog(
+                    self,
+                    self.db,
+                    self.entry_manager,
+                    self.sharing_service,
+                    self.key_exchange_service,
+                    self.qr_service,
+                    entry_id,
+                )
+            )
+        finally:
+            self._set_crypto_busy(False)
 
     def on_contacts(self) -> None:
-        ContactsDialog(self, self.db, self.key_exchange_service)
+        self._run_without_focus_lock(lambda: ContactsDialog(self, self.db, self.key_exchange_service))
 
     def on_settings(self) -> None:
-        value = simpledialog.askinteger(
-            "Настройки буфера обмена",
-            "Таймаут автоочистки (секунды, 0 = никогда, 5-300 = допустимый диапазон):",
-            initialvalue=self.clipboard_timeout,
-            parent=self,
-        )
+        def _ask():
+            return simpledialog.askinteger(
+                "Настройки буфера обмена",
+                "Таймаут автоочистки (секунды, 0 = никогда, 5-300 = допустимый диапазон):",
+                initialvalue=self.clipboard_timeout,
+                parent=self,
+            )
+
+        value = self._run_without_focus_lock(_ask)
         if value is None:
-            SettingsDialog(self)
+            self._run_without_focus_lock(lambda: SettingsDialog(self))
             return
         if value != 0 and not (5 <= value <= 300):
             messagebox.showerror("Ошибка", "Допустимо 0 или значение от 5 до 300 секунд")
@@ -902,12 +999,15 @@ class MainWindow(tk.Tk):
         self._show_toast("Настройка буфера обмена сохранена")
 
     def on_security_profile(self) -> None:
-        choice = simpledialog.askstring(
-            "Security Profile",
-            "Введите профиль: standard / enhanced / paranoid",
-            initialvalue=self.security_profile_name,
-            parent=self,
-        )
+        def _ask():
+            return simpledialog.askstring(
+                "Security Profile",
+                "Введите профиль: standard / enhanced / paranoid",
+                initialvalue=self.security_profile_name,
+                parent=self,
+            )
+
+        choice = self._run_without_focus_lock(_ask)
         if not choice:
             return
 
@@ -924,6 +1024,11 @@ class MainWindow(tk.Tk):
         self.panic_mode.config.show_fake_error = self.security_profile.name == "Paranoid"
         self._save_security_profile(normalized)
         self._update_security_status()
+        self.activity_monitor.record_activity()
+        self.tray.update_state(
+            locked=not bool(self.auth.get_encryption_key()),
+            security_profile=self.security_profile.name,
+        )
 
         try:
             self.audit.log_event(
@@ -946,7 +1051,7 @@ class MainWindow(tk.Tk):
         if not self.auth.get_encryption_key():
             messagebox.showerror("Ошибка", "Хранилище заблокировано")
             return
-        AuditLogViewer(self, self.db, self.audit)
+        self._run_without_focus_lock(lambda: AuditLogViewer(self, self.db, self.audit))
 
     def on_about(self) -> None:
         messagebox.showinfo(
@@ -954,10 +1059,64 @@ class MainWindow(tk.Tk):
             "CryptoSafe Manager — Sprint 7\nVault, audit logging, secure clipboard, import/export, sharing, QR and security hardening.",
         )
 
-    def on_panic_mode(self) -> None:
-        self.panic_mode.activate(method="hotkey")
+    def on_panic_mode_hotkey(self) -> None:
+        self.on_panic_mode("hotkey")
+
+    def on_panic_mode_tray(self) -> None:
+        self.on_panic_mode("tray")
+
+    def on_panic_mode_button(self) -> None:
+        self.on_panic_mode("button")
+
+    def on_panic_mode(self, method: str = "hotkey") -> None:
+        try:
+            self.panic_mode.activate(method=method)
+        finally:
+            try:
+                self.tray.show_notification("CryptoSafe Manager", "Panic mode activated")
+            except Exception:
+                pass
 
     def handle_panic_ui(self, close_app: bool = False) -> None:
+        try:
+            if self.security_profile.clear_clipboard_on_lock:
+                self.clipboard_service.clear_clipboard("panic")
+        except Exception:
+            pass
+
+        try:
+            self._set_status("locked")
+        except Exception:
+            pass
+
+        try:
+            self.tray.update_state(
+                locked=True,
+                clipboard_active=False,
+                clipboard_remaining=0,
+                security_profile=self.security_profile.name,
+                crypto_busy=False,
+            )
+        except Exception:
+            pass
+
+        try:
+            for child in self.winfo_children():
+                if isinstance(child, tk.Toplevel):
+                    try:
+                        child.destroy()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            if self._lock_overlay and self._lock_overlay.winfo_exists():
+                self._lock_overlay.destroy()
+        except Exception:
+            pass
+        self._lock_overlay = None
+
         try:
             self.withdraw()
         except Exception:
@@ -967,7 +1126,7 @@ class MainWindow(tk.Tk):
             self.after(200, self.on_exit)
             return
 
-        self.after(300, self._show_lock_overlay)
+        self.after(250, self._show_lock_overlay)
 
     def _show_toast(self, text: str) -> None:
         toast = tk.Toplevel(self)
@@ -982,20 +1141,39 @@ class MainWindow(tk.Tk):
     def _on_clipboard_state_changed(self, status: dict) -> None:
         if status.get("warning"):
             self._show_toast("Буфер будет очищен через 5 секунд")
+            self.tray.update_state(
+                clipboard_active=True,
+                clipboard_remaining=5,
+                locked=not bool(self.auth.get_encryption_key()),
+                security_profile=self.security_profile.name,
+            )
             return
 
         if not status.get("active"):
             self.clipboard_var.set("Буфер: пусто")
+            self.tray.update_state(
+                clipboard_active=False,
+                clipboard_remaining=0,
+                locked=not bool(self.auth.get_encryption_key()),
+                security_profile=self.security_profile.name,
+            )
             return
 
         preview = status.get("preview", "")
-        remaining = status.get("remaining_seconds", 0)
+        remaining = int(status.get("remaining_seconds", 0))
         data_type = status.get("data_type", "text")
         self.clipboard_var.set(f"Буфер: {data_type} | {preview} | {remaining}s")
+        self.tray.update_state(
+            clipboard_active=True,
+            clipboard_remaining=remaining,
+            locked=not bool(self.auth.get_encryption_key()),
+            security_profile=self.security_profile.name,
+        )
 
     def _on_clipboard_suspicious_activity(self, _message: str) -> None:
         self._show_toast("Внимание: буфер обмена изменён извне")
         self.clipboard_var.set("Буфер: подозрительная активность")
+        self.tray.show_notification("CryptoSafe Manager", "Подозрительная активность буфера обмена")
 
     def _poll_clipboard_status(self) -> None:
         try:
@@ -1005,6 +1183,54 @@ class MainWindow(tk.Tk):
         except Exception:
             pass
         self.after(500, self._poll_clipboard_status)
+
+    def _minimize_to_tray(self) -> None:
+        self._window_was_withdrawn_to_tray = True
+        self.withdraw()
+        self.tray.update_state(
+            locked=not bool(self.auth.get_encryption_key()),
+            security_profile=self.security_profile.name,
+        )
+        self.tray.show_notification("CryptoSafe Manager", "Приложение свернуто в трей")
+
+    def _restore_from_tray(self) -> None:
+        self._window_was_withdrawn_to_tray = False
+        self.deiconify()
+        self.lift()
+        try:
+            self.focus_force()
+        except Exception:
+            pass
+        self.tray.update_state(
+            locked=not bool(self.auth.get_encryption_key()),
+            security_profile=self.security_profile.name,
+        )
+
+    def _tray_lock_vault(self) -> None:
+        self._auto_lock()
+        self.tray.show_notification("CryptoSafe Manager", "Vault заблокирован")
+
+    def _tray_unlock_vault(self) -> None:
+        if self.auth.get_encryption_key():
+            self._restore_from_tray()
+            return
+        self._restore_from_tray()
+        self._show_lock_overlay()
+
+    def _tray_quick_search(self) -> None:
+        self._restore_from_tray()
+        try:
+            self.search_var.set("")
+            self.focus_force()
+        except Exception:
+            pass
+
+    def _tray_clear_clipboard(self) -> None:
+        try:
+            self.clipboard_service.clear_clipboard("tray")
+            self.tray.show_notification("CryptoSafe Manager", "Буфер обмена очищен")
+        except Exception:
+            pass
 
     def on_exit(self) -> None:
         try:
@@ -1017,6 +1243,10 @@ class MainWindow(tk.Tk):
             pass
         try:
             self.clipboard_service.clear_clipboard("app_close")
+        except Exception:
+            pass
+        try:
+            self.tray.stop()
         except Exception:
             pass
         self.auth.logout()
